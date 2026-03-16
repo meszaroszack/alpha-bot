@@ -15,7 +15,8 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 const KALSHI_WS_DEMO = 'wss://demo-api.kalshi.co/trade-api/ws/v2';
-const KALSHI_WS_LIVE = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
+const KALSHI_WS_LIVE = 'wss://api.kalshi.com/trade-api/ws/v2';
+const KALSHI_WS_PATH = '/trade-api/ws/v2';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const publicDir = path.join(__dirname, 'public');
 
@@ -144,31 +145,100 @@ server.on('upgrade', (request, socket, head) => {
   });
 });
 
+function buildKalshiWsHeaders(apiKeyId, privateKeyPem) {
+  // Kalshi WS auth: sign timestamp + "GET" + ws path (no query params)
+  const timestamp = String(Date.now());
+  const signature = signRequest(privateKeyPem, timestamp, 'GET', KALSHI_WS_PATH);
+  return {
+    'KALSHI-ACCESS-KEY': apiKeyId,
+    'KALSHI-ACCESS-TIMESTAMP': timestamp,
+    'KALSHI-ACCESS-SIGNATURE': signature,
+  };
+}
+
 wss.on('connection', (clientWs, request) => {
   const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
   const environment = url.searchParams.get('environment') || 'Demo';
   const kalshiUrl = environment === 'Live' ? KALSHI_WS_LIVE : KALSHI_WS_DEMO;
 
-  const kalshiWs = new WebSocket(kalshiUrl);
+  // Extract session token from query string so we can sign the WS handshake
+  const sessionToken = url.searchParams.get('token') || null;
+  const apiKeyId = process.env.KALSHI_API_KEY;
+  const privateKeyPem = process.env.KALSHI_API_SECRET;
 
-  kalshiWs.on('message', (data) => {
-    if (clientWs.readyState === 1) clientWs.send(data);
-  });
+  // Resolve API key: prefer token payload, fall back to env
+  let resolvedApiKey = apiKeyId;
+  if (sessionToken) {
+    try {
+      const payload = jwt.verify(sessionToken, JWT_SECRET);
+      resolvedApiKey = payload.apiKey || apiKeyId;
+    } catch (_) { /* use env fallback */ }
+  }
 
-  kalshiWs.on('close', () => {
-    if (clientWs.readyState === 1) clientWs.close();
-  });
+  // Build auth headers for Kalshi WS handshake (required for private channels)
+  let wsOptions = {};
+  if (resolvedApiKey && privateKeyPem) {
+    try {
+      wsOptions.headers = buildKalshiWsHeaders(resolvedApiKey, privateKeyPem);
+    } catch (e) {
+      console.error('[WS] Failed to build Kalshi auth headers:', e.message);
+    }
+  }
 
-  kalshiWs.on('error', () => {
-    if (clientWs.readyState === 1) clientWs.close();
-  });
+  let kalshiWs = null;
+  let reconnectTimer = null;
+  let reconnectAttempts = 0;
+  const MAX_RECONNECTS = 5;
+
+  function connectToKalshi() {
+    // Refresh timestamp for each (re)connect attempt
+    if (resolvedApiKey && privateKeyPem) {
+      try {
+        wsOptions.headers = buildKalshiWsHeaders(resolvedApiKey, privateKeyPem);
+      } catch (_) {}
+    }
+
+    kalshiWs = new WebSocket(kalshiUrl, wsOptions);
+
+    kalshiWs.on('open', () => {
+      reconnectAttempts = 0;
+      console.log(`[WS] Connected to Kalshi (${environment})`);
+    });
+
+    kalshiWs.on('message', (data) => {
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
+    });
+
+    kalshiWs.on('close', (code, reason) => {
+      console.log(`[WS] Kalshi disconnected: code=${code} reason=${reason}`);
+      if (clientWs.readyState === WebSocket.OPEN && reconnectAttempts < MAX_RECONNECTS) {
+        reconnectAttempts++;
+        const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 16000);
+        console.log(`[WS] Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECTS})...`);
+        // Notify client of reconnect attempt
+        try {
+          clientWs.send(JSON.stringify({ type: 'system', msg: `Reconnecting to Kalshi... (attempt ${reconnectAttempts})` }));
+        } catch (_) {}
+        reconnectTimer = setTimeout(connectToKalshi, delay);
+      } else {
+        if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1001, 'Kalshi upstream closed');
+      }
+    });
+
+    kalshiWs.on('error', (err) => {
+      console.error('[WS] Kalshi error:', err.message);
+    });
+  }
+
+  connectToKalshi();
 
   clientWs.on('message', (data) => {
-    if (kalshiWs.readyState === 1) kalshiWs.send(data);
+    if (kalshiWs && kalshiWs.readyState === WebSocket.OPEN) kalshiWs.send(data);
   });
 
   clientWs.on('close', () => {
-    kalshiWs.close();
+    clearTimeout(reconnectTimer);
+    if (kalshiWs) kalshiWs.close();
   });
 });
 

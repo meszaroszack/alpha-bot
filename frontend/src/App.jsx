@@ -80,8 +80,8 @@ const App = () => {
     try {
       const token = await authenticateKalshi();
       const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProtocol}//${window.location.host}/api/ws?environment=${encodeURIComponent(environment)}`;
-      addLog(`Connecting to WebSocket (via proxy): ${wsUrl}`, 'info');
+      const wsUrl = `${wsProtocol}//${window.location.host}/api/ws?environment=${encodeURIComponent(environment)}&token=${encodeURIComponent(token)}`;
+      addLog(`Connecting to WebSocket (via proxy): ${wsProtocol}//${window.location.host}/api/ws?environment=${encodeURIComponent(environment)}`, 'info');
 
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
@@ -94,9 +94,15 @@ const App = () => {
         ws.send(JSON.stringify({ id: 1, cmd: 'subscribe', params: { channels: ['ticker'] } }));
       };
 
+      ws.onerror = () => { addLog('WebSocket error.', 'error'); setIsConnected(false); };
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          // System messages from our proxy (e.g. reconnect notices)
+          if (data.type === 'system') {
+            addLog(data.msg, 'info');
+            return;
+          }
           if (data.type === 'error') {
             const msg = data.msg?.msg || data.msg?.code || JSON.stringify(data.msg);
             addLog(`WebSocket server error: ${msg}`, 'error');
@@ -117,7 +123,6 @@ const App = () => {
         } catch (_) {}
       };
 
-      ws.onerror = () => { addLog('WebSocket error.', 'error'); setIsConnected(false); };
       ws.onclose = (event) => {
         const reason = event.reason || `code ${event.code}`;
         addLog(`WebSocket disconnected: ${reason}`, 'error');
