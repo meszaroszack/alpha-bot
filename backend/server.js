@@ -8,118 +8,217 @@ import WebSocket, { WebSocketServer } from 'ws';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import fs from 'fs';
-import { signRequest, getBaseUrl, getKalshiPath } from './kalshiAuth.js';
+
+import {
+  getBaseUrl, getKalshiPath, getAuthHeaders,
+  buildWsHeaders, calcFee,
+  KALSHI_WS_DEMO, KALSHI_WS_LIVE, KALSHI_WS_PATH,
+} from './kalshiAuth.js';
+import { botEngine } from './botEngine.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
-
-const KALSHI_WS_DEMO = 'wss://demo-api.kalshi.co/trade-api/ws/v2';
-const KALSHI_WS_LIVE = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
-const KALSHI_WS_PATH = '/trade-api/ws/v2';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const publicDir = path.join(__dirname, 'public');
 
 app.use(cors());
 app.use(express.json());
 
-function getAuthHeaders(apiKeyId, privateKeyPem, method, path, timestamp) {
-  const signature = signRequest(privateKeyPem, timestamp, method, path);
-  return {
-    'KALSHI-ACCESS-KEY': apiKeyId,
-    'KALSHI-ACCESS-TIMESTAMP': timestamp,
-    'KALSHI-ACCESS-SIGNATURE': signature,
-    'Content-Type': 'application/json',
-  };
+// ─── SSE broadcast to all connected frontend clients ───────────────────────
+const sseClients = new Set();
+
+function broadcastSSE(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  sseClients.forEach(res => { try { res.write(payload); } catch (_) {} });
 }
 
-// POST /api/kalshi/auth — verify credentials and return a session token
+// Wire bot engine events → SSE
+botEngine.on((event) => {
+  const { type, ...data } = event;
+  broadcastSSE(type, data);
+});
+
+// ─── GET /api/events — SSE stream ──────────────────────────────────────────
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  sseClients.add(res);
+
+  // Send snapshot on connect
+  const snap = botEngine.getSnapshot();
+  res.write(`event: snapshot\ndata: ${JSON.stringify(snap)}\n\n`);
+
+  req.on('close', () => sseClients.delete(res));
+});
+
+// ─── POST /api/kalshi/auth ─────────────────────────────────────────────────
 app.post('/api/kalshi/auth', async (req, res) => {
   const { apiKey, environment = 'Demo' } = req.body || {};
   const apiKeyId = apiKey || process.env.KALSHI_API_KEY;
   const privateKeyPem = process.env.KALSHI_API_SECRET;
 
-  if (!apiKeyId) {
-    return res.status(400).json({ error: 'API Key (KALSHI_API_KEY or apiKey in body) is required.' });
-  }
-  if (!privateKeyPem) {
-    return res.status(500).json({ error: 'Server misconfiguration: KALSHI_API_SECRET is not set.' });
-  }
+  if (!apiKeyId) return res.status(400).json({ error: 'API Key is required.' });
+  if (!privateKeyPem) return res.status(500).json({ error: 'KALSHI_API_SECRET not set in backend .env' });
 
   const baseUrl = getBaseUrl(environment);
-  const path = getKalshiPath('/portfolio/balance');
-  const timestamp = String(Date.now());
+  const p = getKalshiPath('/portfolio/balance');
+  const ts = String(Date.now());
 
   try {
-    const { data } = await axios.get(`${baseUrl}${path}`, {
-      headers: getAuthHeaders(apiKeyId, privateKeyPem, 'GET', path, timestamp),
+    const { data } = await axios.get(`${baseUrl}${p}`, {
+      headers: getAuthHeaders(apiKeyId, privateKeyPem, 'GET', p, ts),
     });
-    const token = jwt.sign(
-      { apiKey: apiKeyId, environment },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-    return res.json({ token, balance: data.balance });
+    const balance = (data.balance || 0) / 100;
+
+    // Register credentials in bot engine
+    botEngine.setCredentials(apiKeyId, privateKeyPem, environment);
+    botEngine.start();
+
+    const token = jwt.sign({ apiKey: apiKeyId, environment }, JWT_SECRET, { expiresIn: '24h' });
+    return res.json({ token, balance });
   } catch (err) {
     const status = err.response?.status || 500;
     const message = err.response?.data?.message || err.response?.data?.error || err.message;
-    return res.status(status).json({ error: message || 'Kalshi authentication failed.' });
+    return res.status(status).json({ error: message || 'Authentication failed.' });
   }
 });
 
-// POST /api/kalshi/order — place order via Kalshi (session token required)
-app.post('/api/kalshi/order', async (req, res) => {
-  const { token, action, market, count, environment: bodyEnv } = req.body || {};
-  if (!token) {
-    return res.status(401).json({ error: 'Session token is required.' });
+// ─── GET /api/kalshi/balance ───────────────────────────────────────────────
+app.get('/api/kalshi/balance', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const privateKeyPem = process.env.KALSHI_API_SECRET;
+    const base = getBaseUrl(payload.environment);
+    const p = getKalshiPath('/portfolio/balance');
+    const ts = String(Date.now());
+    const { data } = await axios.get(`${base}${p}`, {
+      headers: getAuthHeaders(payload.apiKey, privateKeyPem, 'GET', p, ts),
+    });
+    return res.json({ balance: (data.balance || 0) / 100 });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
+});
+
+// ─── GET /api/kalshi/market ────────────────────────────────────────────────
+app.get('/api/kalshi/market', async (req, res) => {
+  const market = botEngine.state?.activeMarket || null;
+  if (market) return res.json(market);
+  // Try fetching if engine hasn't started
+  return res.json({ error: 'Not connected' });
+});
+
+// ─── GET /api/kalshi/positions ─────────────────────────────────────────────
+app.get('/api/kalshi/positions', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    const privateKeyPem = process.env.KALSHI_API_SECRET;
+    const base = getBaseUrl(payload.environment);
+    const p = getKalshiPath('/portfolio/positions?limit=20');
+    const ts = String(Date.now());
+    const { data } = await axios.get(`${base}${p}`, {
+      headers: getAuthHeaders(payload.apiKey, privateKeyPem, 'GET', p, ts),
+    });
+    const positions = (data.market_positions || []).map(pos => ({
+      ticker: pos.ticker,
+      yesContracts: pos.position || 0,
+      noContracts: pos.no_position || 0,
+      realizedPnl: (pos.realized_pnl || 0) / 100,
+      totalCost: (pos.total_traded || 0) / 100,
+      feesPaid: (pos.fees_paid || 0) / 100,
+    }));
+    return res.json({ positions });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST /api/kalshi/order ────────────────────────────────────────────────
+app.post('/api/kalshi/order', async (req, res) => {
+  const { token, action, side, ticker, count, price, environment: bodyEnv } = req.body || {};
+  if (!token) return res.status(401).json({ error: 'Session token required.' });
 
   let payload;
-  try {
-    payload = jwt.verify(token, JWT_SECRET);
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired session token.' });
-  }
+  try { payload = jwt.verify(token, JWT_SECRET); }
+  catch { return res.status(401).json({ error: 'Invalid or expired session token.' }); }
 
   const apiKeyId = payload.apiKey;
   const environment = bodyEnv || payload.environment || 'Demo';
   const privateKeyPem = process.env.KALSHI_API_SECRET;
-  if (!privateKeyPem) {
-    return res.status(500).json({ error: 'Server misconfiguration: KALSHI_API_SECRET is not set.' });
-  }
+  if (!privateKeyPem) return res.status(500).json({ error: 'KALSHI_API_SECRET not set.' });
 
-  const baseUrl = getBaseUrl(environment);
-  const path = getKalshiPath('/portfolio/orders');
-  const timestamp = String(Date.now());
+  const base = getBaseUrl(environment);
+  const p = getKalshiPath('/portfolio/orders');
+  const ts = String(Date.now());
 
-  const ticker = market || 'BTC-USD';
-  const actionLower = (action || 'buy').toLowerCase();
+  // Resolve market ticker
+  const marketTicker = ticker || botEngine.state?.activeMarket?.ticker;
+  if (!marketTicker) return res.status(400).json({ error: 'No active market found. Bot must be connected first.' });
+
+  const tradeSide = (side || (action === 'buy' ? 'yes' : 'no')).toLowerCase();
+  const contractCount = Math.max(1, parseInt(count, 10) || 1);
+  const contractPrice = Math.round((price || 50) * 100) / 100; // dollars
+  const priceInCents = Math.round(contractPrice * 100);
+
+  const fee = calcFee(contractCount, contractPrice, true);
+
   const orderBody = {
-    ticker,
-    action: actionLower,
-    side: actionLower === 'buy' ? 'yes' : 'no',
-    count: Math.max(1, parseInt(count, 10) || 1),
+    ticker: marketTicker,
+    action: 'buy',
+    side: tradeSide,
+    count: contractCount,
     type: 'limit',
-    yes_price: 50,
-    no_price: 50,
-    client_order_id: `alpha-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    ...(tradeSide === 'yes' ? { yes_price: priceInCents } : { no_price: priceInCents }),
+    client_order_id: `alpha-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
   };
-  if (actionLower === 'buy') delete orderBody.no_price;
-  else delete orderBody.yes_price;
 
   try {
-    const { data } = await axios.post(`${baseUrl}${path}`, orderBody, {
-      headers: getAuthHeaders(apiKeyId, privateKeyPem, 'POST', path, timestamp),
+    const { data } = await axios.post(`${base}${p}`, orderBody, {
+      headers: getAuthHeaders(apiKeyId, privateKeyPem, 'POST', p, ts),
     });
-    return res.json(data);
+    return res.json({ ...data, fee, priceInCents, marketTicker });
   } catch (err) {
     const status = err.response?.status || 500;
     const message = err.response?.data?.message || err.response?.data?.error || err.message;
-    return res.status(status).json({ error: message || 'Order placement failed.' });
+    return res.status(status).json({ error: message || 'Order failed.' });
   }
 });
 
-// Serve built frontend when present (e.g. after npm run build for Railway)
+// ─── POST /api/bot/toggle ──────────────────────────────────────────────────
+app.post('/api/bot/toggle', (req, res) => {
+  const { enabled } = req.body || {};
+  botEngine.setBotEnabled(!!enabled);
+  return res.json({ enabled: botEngine.config.botEnabled });
+});
+
+// ─── POST /api/bot/config ──────────────────────────────────────────────────
+app.post('/api/bot/config', (req, res) => {
+  const { strategy, algoMode, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize } = req.body || {};
+  const patch = {};
+  if (strategy != null) patch.strategy = strategy;
+  if (algoMode != null) patch.algoMode = algoMode;
+  if (riskPct != null) patch.riskPct = Number(riskPct);
+  if (maxPositions != null) patch.maxPositions = Number(maxPositions);
+  if (minConfidence != null) patch.minConfidence = Number(minConfidence);
+  if (dailyLossLimitPct != null) patch.dailyLossLimitPct = Number(dailyLossLimitPct);
+  if (maxTradeSize != null) patch.maxTradeSize = Number(maxTradeSize);
+  botEngine.setConfig(patch);
+  return res.json({ config: botEngine.config });
+});
+
+// ─── GET /api/bot/snapshot ─────────────────────────────────────────────────
+app.get('/api/bot/snapshot', (_req, res) => {
+  res.json(botEngine.getSnapshot());
+});
+
+// ─── Serve built frontend ──────────────────────────────────────────────────
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
   app.get('*', (req, res, next) => {
@@ -128,81 +227,46 @@ if (fs.existsSync(publicDir)) {
   });
 }
 
-// HTTP server (for Express + WebSocket upgrade)
+// ─── WebSocket proxy: browser → server → Kalshi ───────────────────────────
 const server = createServer(app);
-
-// WebSocket proxy: browser -> our server -> Kalshi (avoids origin/1006 from direct Kalshi connection)
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (request, socket, head) => {
   const pathname = request.url?.split('?')[0] || '';
-  if (pathname !== '/api/ws') {
-    socket.destroy();
-    return;
-  }
-  wss.handleUpgrade(request, socket, head, (clientWs) => {
-    wss.emit('connection', clientWs, request);
-  });
+  if (pathname !== '/api/ws') { socket.destroy(); return; }
+  wss.handleUpgrade(request, socket, head, (ws) => wss.emit('connection', ws, request));
 });
-
-function buildKalshiWsHeaders(apiKeyId, privateKeyPem) {
-  // Kalshi WS auth: sign timestamp + "GET" + ws path (no query params)
-  const timestamp = String(Date.now());
-  const signature = signRequest(privateKeyPem, timestamp, 'GET', KALSHI_WS_PATH);
-  return {
-    'KALSHI-ACCESS-KEY': apiKeyId,
-    'KALSHI-ACCESS-TIMESTAMP': timestamp,
-    'KALSHI-ACCESS-SIGNATURE': signature,
-  };
-}
 
 wss.on('connection', (clientWs, request) => {
   const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
   const environment = url.searchParams.get('environment') || 'Demo';
+  const sessionToken = url.searchParams.get('token') || null;
   const kalshiUrl = environment === 'Live' ? KALSHI_WS_LIVE : KALSHI_WS_DEMO;
 
-  // Extract session token from query string so we can sign the WS handshake
-  const sessionToken = url.searchParams.get('token') || null;
-  const apiKeyId = process.env.KALSHI_API_KEY;
-  const privateKeyPem = process.env.KALSHI_API_SECRET;
-
-  // Resolve API key: prefer token payload, fall back to env
-  let resolvedApiKey = apiKeyId;
+  let resolvedApiKey = process.env.KALSHI_API_KEY;
   if (sessionToken) {
     try {
       const payload = jwt.verify(sessionToken, JWT_SECRET);
-      resolvedApiKey = payload.apiKey || apiKeyId;
-    } catch (_) { /* use env fallback */ }
+      resolvedApiKey = payload.apiKey || resolvedApiKey;
+    } catch (_) {}
   }
 
-  // Build auth headers for Kalshi WS handshake (required for private channels)
-  let wsOptions = {};
-  if (resolvedApiKey && privateKeyPem) {
-    try {
-      wsOptions.headers = buildKalshiWsHeaders(resolvedApiKey, privateKeyPem);
-    } catch (e) {
-      console.error('[WS] Failed to build Kalshi auth headers:', e.message);
-    }
-  }
-
+  const privateKeyPem = process.env.KALSHI_API_SECRET;
   let kalshiWs = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
   const MAX_RECONNECTS = 5;
 
   function connectToKalshi() {
-    // Refresh timestamp for each (re)connect attempt
+    let wsOptions = {};
     if (resolvedApiKey && privateKeyPem) {
-      try {
-        wsOptions.headers = buildKalshiWsHeaders(resolvedApiKey, privateKeyPem);
-      } catch (_) {}
+      try { wsOptions.headers = buildWsHeaders(resolvedApiKey, privateKeyPem); } catch (_) {}
     }
 
     kalshiWs = new WebSocket(kalshiUrl, wsOptions);
 
     kalshiWs.on('open', () => {
       reconnectAttempts = 0;
-      console.log(`[WS] Connected to Kalshi (${environment})`);
     });
 
     kalshiWs.on('message', (data) => {
@@ -210,15 +274,10 @@ wss.on('connection', (clientWs, request) => {
     });
 
     kalshiWs.on('close', (code, reason) => {
-      console.log(`[WS] Kalshi disconnected: code=${code} reason=${reason}`);
       if (clientWs.readyState === WebSocket.OPEN && reconnectAttempts < MAX_RECONNECTS) {
         reconnectAttempts++;
         const delay = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 16000);
-        console.log(`[WS] Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${MAX_RECONNECTS})...`);
-        // Notify client of reconnect attempt
-        try {
-          clientWs.send(JSON.stringify({ type: 'system', msg: `Reconnecting to Kalshi... (attempt ${reconnectAttempts})` }));
-        } catch (_) {}
+        try { clientWs.send(JSON.stringify({ type: 'system', msg: `Reconnecting to Kalshi... (attempt ${reconnectAttempts}/${MAX_RECONNECTS})` })); } catch (_) {}
         reconnectTimer = setTimeout(connectToKalshi, delay);
       } else {
         if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1001, 'Kalshi upstream closed');

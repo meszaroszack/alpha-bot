@@ -1,15 +1,15 @@
 import crypto from 'crypto';
 
-const DEMO_BASE = 'https://demo-api.kalshi.co';
-const LIVE_BASE = 'https://api.elections.kalshi.com';
+export const DEMO_BASE = 'https://demo-api.kalshi.co';
+export const LIVE_BASE = 'https://api.elections.kalshi.com';
+
+export const KALSHI_WS_DEMO = 'wss://demo-api.kalshi.co/trade-api/ws/v2';
+export const KALSHI_WS_LIVE = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
+export const KALSHI_WS_PATH = '/trade-api/ws/v2';
 
 /**
- * Create RSA-PSS SHA256 signature for Kalshi API.
- * Message format: timestamp + method + path (no query params).
- * @param {string} privateKeyPem - PEM string of RSA private key
- * @param {string} timestamp - milliseconds
- * @param {string} method - GET, POST, etc.
- * @param {string} path - e.g. /trade-api/v2/portfolio/balance
+ * RSA-PSS SHA256 signature for Kalshi API.
+ * Message: timestamp + method + path (no query params)
  */
 export function signRequest(privateKeyPem, timestamp, method, path) {
   const pathNoQuery = path.split('?')[0];
@@ -27,6 +27,37 @@ export function getBaseUrl(environment) {
   return environment === 'Live' ? LIVE_BASE : DEMO_BASE;
 }
 
-export function getKalshiPath(path) {
-  return path.startsWith('/trade-api') ? path : `/trade-api/v2${path.startsWith('/') ? path : '/' + path}`;
+export function getKalshiPath(p) {
+  return p.startsWith('/trade-api') ? p : `/trade-api/v2${p.startsWith('/') ? p : '/' + p}`;
+}
+
+export function getAuthHeaders(apiKeyId, privateKeyPem, method, path, timestamp) {
+  const ts = timestamp || String(Date.now());
+  const sig = signRequest(privateKeyPem, ts, method, path);
+  return {
+    'KALSHI-ACCESS-KEY': apiKeyId,
+    'KALSHI-ACCESS-TIMESTAMP': ts,
+    'KALSHI-ACCESS-SIGNATURE': sig,
+    'Content-Type': 'application/json',
+  };
+}
+
+export function buildWsHeaders(apiKeyId, privateKeyPem) {
+  const ts = String(Date.now());
+  const sig = signRequest(privateKeyPem, ts, 'GET', KALSHI_WS_PATH);
+  return {
+    'KALSHI-ACCESS-KEY': apiKeyId,
+    'KALSHI-ACCESS-TIMESTAMP': ts,
+    'KALSHI-ACCESS-SIGNATURE': sig,
+  };
+}
+
+/**
+ * Kalshi fee formula (taker): ceil(0.07 * C * P * (1-P) * 100) / 100
+ * Maker: same with 0.0175 multiplier
+ */
+export function calcFee(contracts, priceDollars, maker = false) {
+  const mult = maker ? 0.0175 : 0.07;
+  const p = Math.max(0.01, Math.min(0.99, priceDollars));
+  return Math.ceil(mult * contracts * p * (1 - p) * 100) / 100;
 }
