@@ -79,7 +79,7 @@ const App = () => {
     setIsConnecting(true);
     try {
       const token = await authenticateKalshi();
-      const wsUrl = environment === 'Demo' ? 'wss://demo-api.kalshi.co/trade-api/ws/v2' : 'wss://api.kalshi.com/trade-api/ws/v2';
+      const wsUrl = environment === 'Demo' ? 'wss://demo-api.kalshi.co/trade-api/ws/v2' : 'wss://api.elections.kalshi.com/trade-api/ws/v2';
       addLog(`Connecting to WebSocket: ${wsUrl}`, 'info');
 
       const ws = new WebSocket(wsUrl);
@@ -88,21 +88,41 @@ const App = () => {
       ws.onopen = () => {
         setIsConnecting(false);
         setIsConnected(true);
-        addLog('WebSocket connected. Authenticating stream...', 'success');
-        ws.send(JSON.stringify({ id: 1, cmd: "subscribe", params: { channels: ["ticker"], market_tickers: ["BTC-USD"] } }));
+        addLog('WebSocket connected. Subscribing to ticker...', 'success');
+        // Subscribe to ticker for all markets (no market_tickers = avoid "market not found")
+        ws.send(JSON.stringify({ id: 1, cmd: 'subscribe', params: { channels: ['ticker'] } }));
       };
 
       ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        if (data.type === 'ticker' && data.price) {
-          setCurrentPrice(data.price);
-          updateChartData(data.price);
-          evaluateStrategy(data.price);
-        }
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'error') {
+            const msg = data.msg?.msg || data.msg?.code || JSON.stringify(data.msg);
+            addLog(`WebSocket server error: ${msg}`, 'error');
+            return;
+          }
+          if (data.type === 'ticker' && data.msg) {
+            const msg = data.msg;
+            const price = msg.yes_ask_dollars != null ? Number(msg.yes_ask_dollars)
+              : msg.yes_bid_dollars != null ? Number(msg.yes_bid_dollars)
+              : msg.last_price_dollars != null ? Number(msg.last_price_dollars)
+              : msg.price != null ? Number(msg.price) : null;
+            if (price != null) {
+              setCurrentPrice(price);
+              updateChartData(price);
+              evaluateStrategy(price);
+            }
+          }
+        } catch (_) {}
       };
 
       ws.onerror = () => { addLog('WebSocket error.', 'error'); setIsConnected(false); };
-      ws.onclose = () => { addLog('WebSocket disconnected.', 'error'); setIsConnected(false); setSessionToken(null); };
+      ws.onclose = (event) => {
+        const reason = event.reason || `code ${event.code}`;
+        addLog(`WebSocket disconnected: ${reason}`, 'error');
+        setIsConnected(false);
+        setSessionToken(null);
+      };
     } catch (err) {
       setIsConnecting(false);
     }
