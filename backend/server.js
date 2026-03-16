@@ -3,6 +3,8 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createServer } from 'http';
+import WebSocket, { WebSocketServer } from 'ws';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import fs from 'fs';
@@ -11,6 +13,9 @@ import { signRequest, getBaseUrl, getKalshiPath } from './kalshiAuth.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+const KALSHI_WS_DEMO = 'wss://demo-api.kalshi.co/trade-api/ws/v2';
+const KALSHI_WS_LIVE = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const publicDir = path.join(__dirname, 'public');
 
@@ -122,6 +127,51 @@ if (fs.existsSync(publicDir)) {
   });
 }
 
-app.listen(PORT, () => {
+// HTTP server (for Express + WebSocket upgrade)
+const server = createServer(app);
+
+// WebSocket proxy: browser -> our server -> Kalshi (avoids origin/1006 from direct Kalshi connection)
+const wss = new WebSocketServer({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = request.url?.split('?')[0] || '';
+  if (pathname !== '/api/ws') {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(request, socket, head, (clientWs) => {
+    wss.emit('connection', clientWs, request);
+  });
+});
+
+wss.on('connection', (clientWs, request) => {
+  const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
+  const environment = url.searchParams.get('environment') || 'Demo';
+  const kalshiUrl = environment === 'Live' ? KALSHI_WS_LIVE : KALSHI_WS_DEMO;
+
+  const kalshiWs = new WebSocket(kalshiUrl);
+
+  kalshiWs.on('message', (data) => {
+    if (clientWs.readyState === 1) clientWs.send(data);
+  });
+
+  kalshiWs.on('close', () => {
+    if (clientWs.readyState === 1) clientWs.close();
+  });
+
+  kalshiWs.on('error', () => {
+    if (clientWs.readyState === 1) clientWs.close();
+  });
+
+  clientWs.on('message', (data) => {
+    if (kalshiWs.readyState === 1) kalshiWs.send(data);
+  });
+
+  clientWs.on('close', () => {
+    kalshiWs.close();
+  });
+});
+
+server.listen(PORT, () => {
   console.log(`Alpha Bot backend running at http://localhost:${PORT}`);
 });

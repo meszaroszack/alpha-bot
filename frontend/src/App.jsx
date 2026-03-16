@@ -79,8 +79,9 @@ const App = () => {
     setIsConnecting(true);
     try {
       const token = await authenticateKalshi();
-      const wsUrl = environment === 'Demo' ? 'wss://demo-api.kalshi.co/trade-api/ws/v2' : 'wss://api.elections.kalshi.com/trade-api/ws/v2';
-      addLog(`Connecting to WebSocket: ${wsUrl}`, 'info');
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProtocol}//${window.location.host}/api/ws?environment=${encodeURIComponent(environment)}`;
+      addLog(`Connecting to WebSocket (via proxy): ${wsUrl}`, 'info');
 
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
