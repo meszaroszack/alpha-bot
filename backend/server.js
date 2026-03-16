@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 const KALSHI_WS_DEMO = 'wss://demo-api.kalshi.co/trade-api/ws/v2';
-const KALSHI_WS_LIVE = 'wss://api.kalshi.com/trade-api/ws/v2';
+const KALSHI_WS_LIVE = 'wss://api.elections.kalshi.com/trade-api/ws/v2';
 const KALSHI_WS_PATH = '/trade-api/ws/v2';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const publicDir = path.join(__dirname, 'public');

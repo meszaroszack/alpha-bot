@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 
 const DEMO_BASE = 'https://demo-api.kalshi.co';
-const LIVE_BASE = 'https://api.kalshi.com';
+const LIVE_BASE = 'https://api.elections.kalshi.com';
 
 /**
  * Create RSA-PSS SHA256 signature for Kalshi API.
