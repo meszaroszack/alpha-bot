@@ -44,6 +44,9 @@ export class BotEngine {
       maxContractsPerTrade: 10,      // position sizing cap
       cooldownMinutes:     5,        // minutes to wait after a loss
       botEnabled:          false,
+      stopLossPct:         40,       // exit if position loses 40% of cost
+      takeProfitPct:       50,       // exit if position gains 50% of cost
+      exitEnabled:         true,     // master toggle for exit logic
     };
 
     // Runtime state
@@ -66,6 +69,9 @@ export class BotEngine {
       reconnectCount:      0,
       cooldownUntil:       0,         // timestamp — skip trading until this time
       externalSignals:     null,      // cached external signals
+
+      // Active trades for exit monitoring
+      activeTrades:        [],        // trades awaiting exit/settlement
 
       // Supabase run tracking
       supabaseRunId:       null,      // UUID of the current bot_run row
@@ -436,6 +442,9 @@ export class BotEngine {
       insertLog('error', `Reconcile failed for ${ticker}: ${err.message}`, { ticker }, runId);
     }
 
+    // Remove from activeTrades — position is settled
+    this.state.activeTrades = this.state.activeTrades.filter(t => t.ticker !== ticker);
+
     // Update the trade row with the Kalshi-sourced truth
     await updateTrade(tradeId, {
       status,
@@ -642,6 +651,16 @@ export class BotEngine {
 
       this.state.feesTotal += fee;
 
+      // Track active trade for exit monitoring
+      this.state.activeTrades.push({
+        ticker:          market.ticker,
+        side,
+        contracts,
+        entryPrice:      contractPrice,
+        supabaseTradeId: null, // will be set below after Supabase insert
+        entryTime:       Date.now(),
+      });
+
       // ── Write to Supabase trades table ───────────────────────────────────
       const supabaseTradeId = await insertTrade({
         runId:            this.state.supabaseRunId,
@@ -660,6 +679,10 @@ export class BotEngine {
 
       // Store the Supabase trade UUID so we can reconcile after settlement
       this.state.supabaseTradeId = supabaseTradeId;
+
+      // Back-fill supabaseTradeId on the active trade entry
+      const activeTrade = this.state.activeTrades.find(t => t.ticker === market.ticker && !t.supabaseTradeId);
+      if (activeTrade) activeTrade.supabaseTradeId = supabaseTradeId;
 
       const logEntry = {
         id:         Date.now(),
@@ -708,6 +731,155 @@ export class BotEngine {
     }
   }
 
+  // ─── Exit logic — stop-loss & take-profit ──────────────────────────────────
+
+  async exitPosition(trade, reason) {
+    this.emit('log', { msg: `[EXIT] ${reason} triggered for ${trade.ticker} (${trade.side})`, type: 'info' });
+    insertLog('exit', `${reason} for ${trade.ticker}`, { ticker: trade.ticker, side: trade.side, reason }, this.state.supabaseRunId);
+
+    // Fetch fresh orderbook to get current bid
+    let currentBidCents;
+    try {
+      const ob = await this.kalshiGet(`/markets/${trade.ticker}/orderbook`);
+      const obData = ob.orderbook_fp || ob.orderbook || {};
+      const bidArr = trade.side === 'yes'
+        ? (obData.yes_dollars || [])
+        : (obData.no_dollars || []);
+      const bids = bidArr.map(([p]) => parseFloat(p)).filter(p => p > 0);
+      if (bids.length === 0) {
+        this.emit('log', { msg: `[EXIT] No bids for ${trade.ticker} ${trade.side} — skipping`, type: 'warn' });
+        return;
+      }
+      currentBidCents = Math.round(Math.max(...bids) * 100);
+    } catch (err) {
+      // Market may have expired
+      if (err.response?.status === 404 || err.response?.status === 400) {
+        this.emit('log', { msg: `[EXIT] Market ${trade.ticker} expired — removing from activeTrades`, type: 'info' });
+        this.state.activeTrades = this.state.activeTrades.filter(t => t.ticker !== trade.ticker);
+        await this.reconcileSettledTrade(trade.ticker);
+        return;
+      }
+      this.emit('log', { msg: `[EXIT] Orderbook fetch failed for ${trade.ticker}: ${err.message}`, type: 'warn' });
+      return;
+    }
+
+    const orderBody = {
+      ticker:          trade.ticker,
+      action:          'sell',
+      side:            trade.side,
+      count:           trade.contracts,
+      type:            'limit',
+      ...(trade.side === 'yes'
+        ? { yes_price: currentBidCents }
+        : { no_price:  currentBidCents }),
+      client_order_id: `exit-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    };
+
+    try {
+      const result = await this.kalshiPost('/portfolio/orders', orderBody);
+      const orderId = result.order?.order_id || result.order_id || null;
+
+      if (orderId) {
+        const fillResult = await this.waitForFill(orderId);
+        if (!fillResult.filled) {
+          this.emit('log', { msg: `[EXIT] Sell order ${orderId} not filled — will retry next tick`, type: 'warn' });
+          return;
+        }
+        this.emit('log', { msg: `[EXIT] ${reason} sell FILLED for ${trade.ticker} @ ${currentBidCents}¢`, type: 'success' });
+      }
+
+      // Remove from activeTrades
+      this.state.activeTrades = this.state.activeTrades.filter(t => t.ticker !== trade.ticker);
+
+      // Calculate realized P&L for the exit
+      const exitPrice = currentBidCents / 100;
+      const pnl = (exitPrice - trade.entryPrice) * trade.contracts;
+
+      // Log the exit trade to Supabase
+      const exitTradeId = await insertTrade({
+        runId:            this.state.supabaseRunId,
+        orderId,
+        ticker:           trade.ticker,
+        side:             trade.side,
+        action:           'sell',
+        count:            trade.contracts,
+        pricePerContract: exitPrice,
+        totalCost:        exitPrice * trade.contracts,
+        feeDollars:       calcFee(trade.contracts, exitPrice, false),
+        signalReason:     `[${reason}] entry: ${(trade.entryPrice * 100).toFixed(0)}¢ → exit: ${currentBidCents}¢ | P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
+        btcPriceAtTrade:  this.state.btcPrice,
+        marketTitle:      trade.ticker,
+      });
+
+      // Update session P&L
+      this.state.sessionPnl += pnl;
+      this.emit('pnl', { sessionPnl: this.state.sessionPnl });
+
+      // Cooldown after stop-loss
+      if (reason === 'STOP_LOSS') {
+        this.state.cooldownUntil = Date.now() + (this.config.cooldownMinutes || 5) * 60000;
+        this.emit('log', { msg: `Stop-loss on ${trade.ticker} — cooldown ${this.config.cooldownMinutes} min`, type: 'info' });
+      }
+
+      insertLog('exit', `${reason} filled: ${trade.ticker} ${trade.contracts}c @ ${currentBidCents}¢ | P&L: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`, {
+        orderId, ticker: trade.ticker, reason, pnl, exitTradeId,
+      }, this.state.supabaseRunId);
+
+    } catch (err) {
+      const msg = err.response?.data?.message || err.response?.data?.error || err.message;
+      this.emit('log', { msg: `[EXIT] Sell failed for ${trade.ticker}: ${msg}`, type: 'error' });
+      insertLog('error', `Exit sell failed for ${trade.ticker}: ${msg}`, { ticker: trade.ticker, reason }, this.state.supabaseRunId);
+      // Keep in activeTrades — will retry next tick
+    }
+  }
+
+  async checkExits() {
+    // Copy the array since exitPosition mutates activeTrades
+    const trades = [...this.state.activeTrades];
+    for (const trade of trades) {
+      // Skip if already removed by a prior exit in this loop
+      if (!this.state.activeTrades.includes(trade)) continue;
+
+      let currentBid;
+      try {
+        // Reuse active market orderbook data if same ticker
+        if (this.state.activeMarket?.ticker === trade.ticker) {
+          currentBid = trade.side === 'yes'
+            ? this.state.activeMarket.yesBid
+            : this.state.activeMarket.noBid;
+        }
+        // If no cached bid or zero, fetch fresh
+        if (!currentBid || currentBid <= 0) {
+          const ob = await this.kalshiGet(`/markets/${trade.ticker}/orderbook`);
+          const obData = ob.orderbook_fp || ob.orderbook || {};
+          const bidArr = trade.side === 'yes'
+            ? (obData.yes_dollars || [])
+            : (obData.no_dollars || []);
+          const bids = bidArr.map(([p]) => parseFloat(p)).filter(p => p > 0);
+          currentBid = bids.length > 0 ? Math.max(...bids) : 0;
+        }
+      } catch (err) {
+        this.emit('log', { msg: `[EXIT-CHECK] Orderbook failed for ${trade.ticker}: ${err.message} — skipping`, type: 'warn' });
+        continue;
+      }
+
+      if (currentBid <= 0) continue;
+
+      const unrealizedPnlPct = ((currentBid - trade.entryPrice) / trade.entryPrice) * 100;
+
+      this.emit('log', {
+        msg: `[MONITOR] ${trade.ticker} ${trade.side} | entry: ${(trade.entryPrice * 100).toFixed(0)}¢ | bid: ${(currentBid * 100).toFixed(0)}¢ | P&L: ${unrealizedPnlPct >= 0 ? '+' : ''}${unrealizedPnlPct.toFixed(1)}%`,
+        type: 'info',
+      });
+
+      if (unrealizedPnlPct <= -this.config.stopLossPct) {
+        await this.exitPosition(trade, 'STOP_LOSS');
+      } else if (unrealizedPnlPct >= this.config.takeProfitPct) {
+        await this.exitPosition(trade, 'TAKE_PROFIT');
+      }
+    }
+  }
+
   // ─── Main loop ──────────────────────────────────────────────────────────────
 
   async tick() {
@@ -726,6 +898,16 @@ export class BotEngine {
       this.state.externalSignals = await getExternalSignals();
     } catch (_) {}
 
+    // ── Signal evaluation & trade placement ─────────────────────────────────
+    await this._evaluateAndTrade(price);
+
+    // ── Monitor open positions for exits ────────────────────────────────────
+    if (this.config.exitEnabled && this.state.activeTrades.length > 0) {
+      await this.checkExits();
+    }
+  }
+
+  async _evaluateAndTrade(price) {
     // Cooldown check
     if (Date.now() < this.state.cooldownUntil) {
       const remaining = Math.ceil((this.state.cooldownUntil - Date.now()) / 60000);
@@ -886,6 +1068,7 @@ export class BotEngine {
       sessionPnl:          this.state.sessionPnl,
       feesTotal:           this.state.feesTotal,
       tradeLog:            this.state.tradeLog,
+      activeTrades:        this.state.activeTrades,
       config:              this.config,
       botEnabled:          this.config.botEnabled,
       supabaseRunId:       this.state.supabaseRunId,

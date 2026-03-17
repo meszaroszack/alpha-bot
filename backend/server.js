@@ -105,7 +105,7 @@ app.get('/api/config', (_req, res) => {
 
 // ─── POST /api/config ─────────────────────────────────────────────────────
 app.post('/api/config', (req, res) => {
-  const { strategy, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize, maxContractsPerTrade, cooldownMinutes } = req.body || {};
+  const { strategy, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize, maxContractsPerTrade, cooldownMinutes, stopLossPct, takeProfitPct, exitEnabled } = req.body || {};
   const patch = {};
   if (strategy != null) patch.strategy = strategy;
   if (riskPct != null) patch.riskPct = Number(riskPct);
@@ -115,6 +115,9 @@ app.post('/api/config', (req, res) => {
   if (maxTradeSize != null) patch.maxTradeSize = Number(maxTradeSize);
   if (maxContractsPerTrade != null) patch.maxContractsPerTrade = Number(maxContractsPerTrade);
   if (cooldownMinutes != null) patch.cooldownMinutes = Number(cooldownMinutes);
+  if (stopLossPct != null) patch.stopLossPct = Number(stopLossPct);
+  if (takeProfitPct != null) patch.takeProfitPct = Number(takeProfitPct);
+  if (exitEnabled != null) patch.exitEnabled = !!exitEnabled;
   botEngine.setConfig(patch);
   return res.json({ config: botEngine.config });
 });
@@ -182,7 +185,7 @@ app.post('/api/bot/toggle', (req, res) => {
 
 // ─── POST /api/bot/config (legacy) ───────────────────────────────────────
 app.post('/api/bot/config', (req, res) => {
-  const { strategy, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize, maxContractsPerTrade, cooldownMinutes } = req.body || {};
+  const { strategy, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize, maxContractsPerTrade, cooldownMinutes, stopLossPct, takeProfitPct, exitEnabled } = req.body || {};
   const patch = {};
   if (strategy != null) patch.strategy = strategy;
   if (riskPct != null) patch.riskPct = Number(riskPct);
@@ -192,6 +195,9 @@ app.post('/api/bot/config', (req, res) => {
   if (maxTradeSize != null) patch.maxTradeSize = Number(maxTradeSize);
   if (maxContractsPerTrade != null) patch.maxContractsPerTrade = Number(maxContractsPerTrade);
   if (cooldownMinutes != null) patch.cooldownMinutes = Number(cooldownMinutes);
+  if (stopLossPct != null) patch.stopLossPct = Number(stopLossPct);
+  if (takeProfitPct != null) patch.takeProfitPct = Number(takeProfitPct);
+  if (exitEnabled != null) patch.exitEnabled = !!exitEnabled;
   botEngine.setConfig(patch);
   return res.json({ config: botEngine.config });
 });
