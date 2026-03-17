@@ -9,6 +9,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import fs from 'fs';
 
+import { isSupabaseEnabled } from './supabase.js';
 import {
   getBaseUrl, getKalshiPath, getAuthHeaders,
   buildWsHeaders, calcFee,
@@ -218,6 +219,17 @@ app.get('/api/bot/snapshot', (_req, res) => {
   res.json(botEngine.getSnapshot());
 });
 
+// ─── GET /api/status ────────────────────────────────────────────────────────
+app.get('/api/status', (_req, res) => {
+  res.json({
+    supabaseEnabled: isSupabaseEnabled(),
+    supabaseRunId:   botEngine.state.supabaseRunId,
+    botEnabled:      botEngine.config.botEnabled,
+    environment:     botEngine.credentials.environment,
+    uptime:          process.uptime(),
+  });
+});
+
 // ─── Serve built frontend ──────────────────────────────────────────────────
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
@@ -304,3 +316,12 @@ wss.on('connection', (clientWs, request) => {
 server.listen(PORT, () => {
   console.log(`Alpha Bot backend running at http://localhost:${PORT}`);
 });
+
+// ─── Graceful shutdown — close bot_run on Railway SIGTERM ────────────────────
+async function gracefulShutdown(signal) {
+  console.log(`[Server] ${signal} received — closing bot run and shutting down`);
+  botEngine.stop();        // stops timers, calls _closeRun internally
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
