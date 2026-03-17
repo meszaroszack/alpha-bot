@@ -1,3 +1,672 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/* ── COMP'D Base Styles ───────────────────────────────────────────────────── */
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: #000000;
+  color: #ffffff;
+  font-family: 'Inter', 'SF Pro Display', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+}
+
+/* ── Colors ────────────────────────────────────────────────────────────────── */
+.green { color: #22C55E !important; }
+.red   { color: #EF4444 !important; }
+.gold  { color: #C9A84C !important; }
+
+/* ── App Layout ────────────────────────────────────────────────────────────── */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── Header ────────────────────────────────────────────────────────────────── */
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 20px;
+  background: #000;
+}
+
+.header-left {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.logo {
+  color: #C9A84C;
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.header-version {
+  color: #999;
+  font-size: 13px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.env-badge {
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.env-live {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22C55E;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.env-demo {
+  background: rgba(255, 255, 255, 0.05);
+  color: #999;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.supabase-status {
+  font-size: 11px;
+  color: #555;
+}
+
+.supabase-status.active {
+  color: #22C55E;
+}
+
+.disconnect-btn {
+  background: none;
+  border: 1px solid #1A1A1A;
+  color: #999;
+  width: 30px;
+  height: 30px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.disconnect-btn:hover {
+  border-color: rgba(201, 168, 76, 0.4);
+  color: #C9A84C;
+}
+
+.header-rule {
+  height: 1px;
+  background: #C9A84C;
+}
+
+/* ── Panels ────────────────────────────────────────────────────────────────── */
+.panels {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+.panel {
+  padding: 16px;
+  overflow-y: auto;
+  border-right: 1px solid #1A1A1A;
+}
+
+.panel:last-child {
+  border-right: none;
+}
+
+.panel-chart {
+  flex: 0 0 60%;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-signal {
+  flex: 0 0 20%;
+}
+
+.panel-trades {
+  flex: 0 0 20%;
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.chart-market-info {
+  font-size: 11px;
+  color: #999;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ── Section Labels ────────────────────────────────────────────────────────── */
+.section-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #C9A84C;
+  margin-bottom: 8px;
+  font-variant: small-caps;
+}
+
+.gold-rule {
+  height: 1px;
+  background: rgba(201, 168, 76, 0.2);
+  margin: 12px 0;
+}
+
+/* ── Chart ──────────────────────────────────────────────────────────────────── */
+.chart-container {
+  flex: 1;
+  background: #0A0A0A;
+  border: 1px solid #1A1A1A;
+  border-radius: 4px;
+  padding: 8px 0;
+}
+
+.chart-footer {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 0 0;
+}
+
+.btc-price-large {
+  font-size: 28px;
+  font-weight: 700;
+  color: #C9A84C;
+}
+
+.btc-change {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.chart-tooltip {
+  background: #111;
+  border: 1px solid #C9A84C;
+  border-radius: 4px;
+  padding: 6px 10px;
+}
+
+.chart-tooltip-time {
+  font-size: 10px;
+  color: #999;
+}
+
+.chart-tooltip-price {
+  font-size: 14px;
+  color: #C9A84C;
+  font-weight: 600;
+}
+
+/* ── Signal Panel ──────────────────────────────────────────────────────────── */
+.field-label-sm {
+  display: block;
+  font-size: 10px;
+  color: #999;
+  margin-bottom: 4px;
+  margin-top: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.field-select {
+  width: 100%;
+  background: #0A0A0A;
+  border: 1px solid rgba(201, 168, 76, 0.3);
+  color: #fff;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'Inter', sans-serif;
+  outline: none;
+}
+
+.field-select:focus {
+  border-color: #C9A84C;
+  box-shadow: 0 0 0 1px rgba(201, 168, 76, 0.4);
+}
+
+.field-input-sm {
+  width: 100%;
+  background: #0A0A0A;
+  border: 1px solid #1A1A1A;
+  color: #fff;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: 'JetBrains Mono', monospace;
+  outline: none;
+}
+
+.field-input-sm:focus {
+  border-color: rgba(201, 168, 76, 0.4);
+}
+
+/* ── Toggle Switch ─────────────────────────────────────────────────────────── */
+.toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  cursor: pointer;
+  padding: 8px 0;
+}
+
+.toggle-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #999;
+  min-width: 30px;
+}
+
+.toggle-switch {
+  width: 48px;
+  height: 24px;
+  border-radius: 12px;
+  position: relative;
+  transition: background 0.2s;
+}
+
+.toggle-switch.off {
+  background: #1A1A1A;
+  border: 1px solid #333;
+}
+
+.toggle-switch.on {
+  background: #C9A84C;
+  border: 1px solid #C9A84C;
+}
+
+.toggle-knob {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  position: absolute;
+  top: 2px;
+  transition: left 0.2s;
+}
+
+.toggle-switch.off .toggle-knob {
+  left: 2px;
+}
+
+.toggle-switch.on .toggle-knob {
+  left: 26px;
+}
+
+/* ── Signal Badge ──────────────────────────────────────────────────────────── */
+.signal-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.signal-yes {
+  background: rgba(34, 197, 94, 0.15);
+  color: #22C55E;
+  border: 1px solid rgba(34, 197, 94, 0.3);
+}
+
+.signal-no {
+  background: rgba(239, 68, 68, 0.15);
+  color: #EF4444;
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+
+.signal-none {
+  background: rgba(255, 255, 255, 0.05);
+  color: #555;
+  border: 1px solid #1A1A1A;
+}
+
+/* ── Confidence ────────────────────────────────────────────────────────────── */
+.confidence-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.confidence-label {
+  font-size: 11px;
+  color: #999;
+}
+
+.confidence-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: #C9A84C;
+}
+
+.confidence-bar {
+  height: 6px;
+  background: #1A1A1A;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.confidence-fill {
+  height: 100%;
+  background: #C9A84C;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+/* ── Thinking Steps ────────────────────────────────────────────────────────── */
+.thinking-steps {
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.thinking-step {
+  font-size: 11px;
+  font-family: 'JetBrains Mono', monospace;
+  padding: 3px 0;
+  line-height: 1.4;
+  animation: fadeIn 0.3s ease;
+}
+
+.step-pass { color: #22C55E; }
+.step-fail { color: #EF4444; }
+.step-info { color: #C9A84C; }
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── P&L Grid ──────────────────────────────────────────────────────────────── */
+.pnl-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  margin-bottom: 4px;
+}
+
+.pnl-label {
+  font-size: 12px;
+  color: #999;
+}
+
+.pnl-label-bold {
+  font-weight: 700;
+  color: #fff;
+}
+
+.pnl-value {
+  font-size: 13px;
+  text-align: right;
+}
+
+.pnl-value-bold {
+  font-weight: 700;
+  font-size: 15px;
+}
+
+/* ── Trade Log ─────────────────────────────────────────────────────────────── */
+.trade-list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.trade-empty {
+  font-size: 12px;
+  color: #555;
+  padding: 12px 0;
+  text-align: center;
+}
+
+.trade-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #111;
+  font-size: 12px;
+}
+
+.trade-time {
+  color: #555;
+  font-size: 10px;
+  min-width: 40px;
+}
+
+.trade-side {
+  font-weight: 700;
+  font-size: 11px;
+  min-width: 28px;
+}
+
+.trade-contracts {
+  color: #999;
+  font-size: 11px;
+}
+
+.trade-pnl {
+  margin-left: auto;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+/* ── Status Bar ────────────────────────────────────────────────────────────── */
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  background: #0A0A0A;
+  border-top: 1px solid #1A1A1A;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-green { background: #22C55E; box-shadow: 0 0 6px rgba(34, 197, 94, 0.5); }
+.dot-red   { background: #EF4444; box-shadow: 0 0 6px rgba(239, 68, 68, 0.5); }
+
+.status-text {
+  color: #999;
+}
+
+.status-sep {
+  color: #333;
+}
+
+/* ── Modal ─────────────────────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal-box {
+  background: #0A0A0A;
+  border: 1px solid rgba(201, 168, 76, 0.3);
+  border-radius: 4px;
+  padding: 32px;
+  width: 420px;
+  max-width: 90vw;
+}
+
+.modal-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 24px;
+}
+
+.modal-subtitle {
+  color: #999;
+  font-size: 14px;
+}
+
+.modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #fff;
+  margin-bottom: 20px;
+}
+
+.field-label {
+  display: block;
+  font-size: 11px;
+  color: #C9A84C;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  margin-bottom: 6px;
+  margin-top: 16px;
+}
+
+.field-input {
+  width: 100%;
+  background: #111;
+  border: 1px solid #1A1A1A;
+  color: #fff;
+  padding: 10px 12px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-family: 'JetBrains Mono', monospace;
+  outline: none;
+}
+
+.field-input:focus {
+  border-color: rgba(201, 168, 76, 0.4);
+  box-shadow: 0 0 0 1px rgba(201, 168, 76, 0.2);
+}
+
+.field-textarea {
+  resize: vertical;
+  min-height: 80px;
+  font-size: 12px;
+}
+
+.env-radio-group {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.env-radio {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border: 1px solid #1A1A1A;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: #999;
+  transition: all 0.15s;
+}
+
+.env-radio.active {
+  border-color: #C9A84C;
+  color: #C9A84C;
+  background: rgba(201, 168, 76, 0.05);
+}
+
+.env-radio input {
+  display: none;
+}
+
+.modal-error {
+  color: #EF4444;
+  font-size: 12px;
+  margin-top: 12px;
+  padding: 8px;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 4px;
+}
+
+.connect-btn {
+  width: 100%;
+  margin-top: 20px;
+  padding: 12px;
+  background: #C9A84C;
+  color: #000;
+  border: none;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+}
+
+.connect-btn:hover {
+  background: #d4b95e;
+}
+
+.connect-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ── Responsive ────────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .panels {
+    flex-direction: column;
+  }
+  .panel {
+    flex: none !important;
+    border-right: none;
+    border-bottom: 1px solid #1A1A1A;
+  }
+  .panel-chart {
+    min-height: 300px;
+  }
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0A0A0A;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1A1A1A;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #333;
+}
