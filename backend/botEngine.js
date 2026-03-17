@@ -7,11 +7,14 @@
  *   - openBotRun()   on start()
  *   - insertSignal() every tick() evaluation
  *   - insertTrade()  on placeTrade() success
- *   - updateTrade()  on position reconciliation (future: after market settles)
+ *   - updateTrade()  on position reconciliation (after market settles)
  *   - closeBotRun()  on stop() or toggle-off
  */
 import axios from 'axios';
-import { strategyAlgo, strategyScalper } from './indicators.js';
+import {
+  analyzeSwing, analyzeThetaDecay, analyzeScalper, analyzeMomentum,
+  getExternalSignals, STRATEGIES,
+} from './indicators.js';
 import { getBaseUrl, getKalshiPath, getAuthHeaders, calcFee } from './kalshiAuth.js';
 import {
   openBotRun, closeBotRun, setRunStartBalance,
@@ -26,18 +29,21 @@ const MAX_CANDLES      = 60;              // keep last 60 candles (~15 hours)
 const MAX_CONSECUTIVE_LOSSES = 3;
 const BALANCE_FLOOR    = 5;              // stop trading below $5
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 export class BotEngine {
   constructor() {
     // Config (user-adjustable)
     this.config = {
-      strategy:           'algo',     // 'algo' | 'scalper'
-      algoMode:           'momentum', // 'momentum' | 'mean_reversion'
-      riskPct:            25,         // % of balance per trade
-      maxPositions:       3,
-      minConfidence:      65,
-      dailyLossLimitPct:  20,         // stop if balance drops this % in a day
-      maxTradeSize:       50,         // hard cap per trade in dollars
-      botEnabled:         false,
+      strategy:            'swing',  // 'swing' | 'theta' | 'scalper' | 'momentum'
+      riskPct:             25,       // % of balance per trade
+      maxPositions:        3,
+      minConfidence:       55,
+      dailyLossLimitPct:   20,       // stop if balance drops this % in a day
+      maxTradeSize:        50,       // hard cap per trade in dollars
+      maxContractsPerTrade: 10,      // position sizing cap
+      cooldownMinutes:     5,        // minutes to wait after a loss
+      botEnabled:          false,
     };
 
     // Runtime state
@@ -47,6 +53,7 @@ export class BotEngine {
       currentCandle:       null,
       indicators:          {},
       signal:              null,
+      lastSignal:          null,      // full signal result for UI
       openPositions:       [],
       sessionStartBalance: null,
       currentBalance:      null,
@@ -55,8 +62,10 @@ export class BotEngine {
       tradeLog:            [],
       consecutiveLosses:   0,
       dailyStartBalance:   null,
-      activeMarket:        null,      // current KXBTC15M-* market from Kalshi
+      activeMarket:        null,      // current KXBTC15M-* or KXBTCD-* market
       reconnectCount:      0,
+      cooldownUntil:       0,         // timestamp — skip trading until this time
+      externalSignals:     null,      // cached external signals
 
       // Supabase run tracking
       supabaseRunId:       null,      // UUID of the current bot_run row
@@ -114,7 +123,6 @@ export class BotEngine {
     if (!isSupabaseEnabled()) return;
     const runId = await openBotRun({
       strategy:      this.config.strategy,
-      algoMode:      this.config.algoMode,
       riskPct:       this.config.riskPct,
       minConfidence: this.config.minConfidence,
       environment:   this.credentials.environment,
@@ -199,6 +207,16 @@ export class BotEngine {
     return data;
   }
 
+  async kalshiDelete(path) {
+    const { apiKeyId, privateKeyPem, environment } = this.credentials;
+    const base     = getBaseUrl(environment);
+    const fullPath = getKalshiPath(path);
+    const ts       = String(Date.now());
+    const headers  = getAuthHeaders(apiKeyId, privateKeyPem, 'DELETE', fullPath, ts);
+    const { data } = await axios.delete(`${base}${fullPath}`, { headers, timeout: 8000 });
+    return data;
+  }
+
   async fetchBalance() {
     try {
       const data    = await this.kalshiGet('/portfolio/balance');
@@ -227,14 +245,26 @@ export class BotEngine {
 
   async fetchActiveMarket() {
     try {
-      const data    = await this.kalshiGet('/markets?series_ticker=KXBTC&status=open&limit=20');
+      // Use KXBTCD series for theta strategy, KXBTC for others
+      const seriesTicker = this.config.strategy === 'theta' ? 'KXBTCD' : 'KXBTC';
+      const data = await this.kalshiGet(`/markets?series_ticker=${seriesTicker}&status=open&limit=20`);
       const markets = data.markets || [];
-      // Find the nearest-expiry KXBTC15M market
-      const btc15m = markets
-        .filter(m => m.ticker?.includes('KXBTC15M'))
-        .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
-      if (btc15m.length === 0) return null;
-      const market = btc15m[0];
+
+      let selected;
+      if (this.config.strategy === 'theta') {
+        // Find KXBTCD markets (hourly BTC above/below)
+        selected = markets
+          .filter(m => m.ticker?.includes('KXBTCD'))
+          .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
+      } else {
+        // Find nearest-expiry KXBTC15M market
+        selected = markets
+          .filter(m => m.ticker?.includes('KXBTC15M'))
+          .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
+      }
+
+      if (selected.length === 0) return null;
+      const market = selected[0];
       this.state.activeMarket = {
         ticker:      market.ticker,
         closeTime:   market.close_time,
@@ -273,6 +303,30 @@ export class BotEngine {
     }
   }
 
+  // ─── Fill Confirmation ──────────────────────────────────────────────────────
+  // After placing an order, poll for fill status (5x at 500ms intervals)
+
+  async waitForFill(orderId, maxAttempts = 5, delayMs = 500) {
+    for (let i = 0; i < maxAttempts; i++) {
+      await sleep(delayMs);
+      try {
+        const data = await this.kalshiGet(`/portfolio/orders/${orderId}`);
+        const order = data.order || data;
+        if (order.status === 'filled' || order.remaining_count === 0) {
+          return { filled: true, fillPrice: order.avg_price, fillCount: order.count };
+        }
+        if (order.status === 'canceled' || order.status === 'cancelled') {
+          return { filled: false };
+        }
+      } catch (_) {}
+    }
+    // Cancel unfilled order
+    try {
+      await this.kalshiDelete(`/portfolio/orders/${orderId}`);
+    } catch (_) {}
+    return { filled: false };
+  }
+
   // ─── Settled P&L reconciliation ─────────────────────────────────────────────
   //
   // Called after a candle closes when we have an open supabaseTradeId.
@@ -306,13 +360,11 @@ export class BotEngine {
       const pos       = positions.find(p => p.ticker === ticker);
 
       if (pos) {
-        // Try realized_pnl_dollars first (newer API), then realized_pnl (cents)
         if (pos.realized_pnl_dollars != null) {
           reconciledPnl = parseFloat(pos.realized_pnl_dollars);
         } else if (pos.realized_pnl != null && pos.realized_pnl !== 0) {
-          reconciledPnl = pos.realized_pnl / 100; // cents → dollars
+          reconciledPnl = pos.realized_pnl / 100;
         } else if (pos.settlement_value != null) {
-          // Fallback: payout - cost
           const contracts   = Math.abs(pos.position_fp ?? pos.position ?? 1);
           const settledPay  = (pos.settlement_value / 100) * contracts;
           const cost        = (pos.total_traded || 0) / 100;
@@ -324,6 +376,13 @@ export class BotEngine {
         status = reconciledPnl > 0 ? 'won' : reconciledPnl < 0 ? 'lost' : 'settled';
         console.log(`[Reconcile] ${ticker} → Kalshi P&L: ${reconciledPnl >= 0 ? '+' : ''}$${reconciledPnl.toFixed(2)} ✓`);
         insertLog('reconcile', `${ticker} settled: ${reconciledPnl >= 0 ? '+' : ''}$${reconciledPnl.toFixed(2)}`, { ticker, pnl: reconciledPnl }, runId);
+
+        // Market cooldown after loss
+        if (reconciledPnl < 0) {
+          this.state.cooldownUntil = Date.now() + (this.config.cooldownMinutes || 5) * 60000;
+          this.emit('log', { msg: `Loss on ${ticker} — cooldown ${this.config.cooldownMinutes} min`, type: 'info' });
+          insertLog('info', `Cooldown activated: ${this.config.cooldownMinutes} min`, { ticker }, runId);
+        }
       } else {
         console.warn(`[Reconcile] ${ticker} — no P&L data found in settled positions`);
         insertLog('warn', `${ticker} — no P&L data in settled positions`, { ticker }, runId);
@@ -352,21 +411,62 @@ export class BotEngine {
     return reconciledPnl;
   }
 
-  // ─── Signal evaluation ───────────────────────────────────────────────────────
+  // ─── Strategy routing ─────────────────────────────────────────────────────
 
   runIndicators() {
     const candles = this.getAllCandles();
     if (candles.length < 2) return null;
-    const closes = candles.map(c => c.close);
+
+    const currentPrice = this.state.btcPrice;
+    const marketInfo = this.state.activeMarket;
+    const ext = this.state.externalSignals;
 
     let result;
-    if (this.config.strategy === 'algo') {
-      result = strategyAlgo(closes, this.config.algoMode);
-    } else {
-      result = strategyScalper(closes, candles);
+    switch (this.config.strategy) {
+      case STRATEGIES.SWING:
+        result = analyzeSwing(candles, currentPrice, marketInfo, ext);
+        break;
+      case STRATEGIES.THETA:
+        result = analyzeThetaDecay(candles, currentPrice, marketInfo, ext);
+        break;
+      case STRATEGIES.SCALPER:
+        result = analyzeScalper(candles, currentPrice, marketInfo, ext);
+        break;
+      case STRATEGIES.MOMENTUM:
+        result = analyzeMomentum(candles, currentPrice, marketInfo, ext);
+        break;
+      default:
+        result = analyzeSwing(candles, currentPrice, marketInfo, ext);
+    }
+
+    // External signals as confidence filters
+    if (ext && result.signal !== 'NONE') {
+      if (ext.fearGreedIndex < 20 && result.signal === 'YES') {
+        result.confidence = Math.max(0, result.confidence - 15);
+        result.reasoning.push('✗ Extreme fear (F&G <20) + YES signal — confidence reduced 15pts');
+      }
+      if (ext.fearGreedIndex > 80 && result.signal === 'NO') {
+        result.confidence = Math.max(0, result.confidence - 15);
+        result.reasoning.push('✗ Extreme greed (F&G >80) + NO signal — confidence reduced 15pts');
+      }
+    }
+
+    // Decay entry logic for theta strategy
+    if (this.config.strategy === STRATEGIES.THETA && marketInfo?.closeTime) {
+      const minutesToExpiry = (new Date(marketInfo.closeTime).getTime() - Date.now()) / 60000;
+      if (minutesToExpiry < 5) {
+        result.signal = 'NONE';
+        result.reasoning.push('✗ <5 min to expiry — too risky for theta');
+      } else if (minutesToExpiry <= 30) {
+        result.reasoning.push('✓ Ideal theta decay window (5-30 min)');
+      } else if (minutesToExpiry > 90 && result.confidence < 75) {
+        result.signal = 'NONE';
+        result.reasoning.push('✗ >90 min to expiry, confidence <75 — skipping');
+      }
     }
 
     this.state.indicators = result;
+    this.state.lastSignal = result;
     this.emit('indicators', result);
     return result;
   }
@@ -420,15 +520,21 @@ export class BotEngine {
       return;
     }
 
-    // Size the trade
-    const rawSize  = balance * (this.config.riskPct / 100);
-    const tradeSize = Math.min(rawSize, this.config.maxTradeSize);
+    // Position sizing by confidence
+    const confidence = indicators.confidence || 0;
+    const maxContracts = this.config.maxContractsPerTrade || 10;
+    let sizedContracts = Math.max(1, Math.floor(confidence / 100 * maxContracts));
 
     // Price: use live bid/ask from the market (always taker — crossing spread)
     const contractPrice = signal === 'YES'
       ? (market.yesAsk || 0.50)
       : (market.noAsk  || 0.50);
-    const contracts   = Math.max(1, Math.floor(tradeSize / contractPrice));
+
+    // Also cap by balance/risk
+    const rawSize  = balance * (this.config.riskPct / 100);
+    const tradeSize = Math.min(rawSize, this.config.maxTradeSize);
+    const balanceContracts = Math.max(1, Math.floor(tradeSize / contractPrice));
+    const contracts = Math.min(sizedContracts, balanceContracts);
     const actualCost  = contracts * contractPrice;
 
     // Fee: TAKER rate (0.07) — we cross the spread on entry
@@ -463,9 +569,20 @@ export class BotEngine {
 
     try {
       const result = await this.kalshiPost('/portfolio/orders', orderBody);
-      this.state.feesTotal += fee;
-
       const orderId = result.order?.order_id || result.order_id || null;
+
+      // Fill confirmation — poll 5x at 500ms
+      if (orderId) {
+        const fillResult = await this.waitForFill(orderId);
+        if (!fillResult.filled) {
+          this.emit('log', { msg: `Order ${orderId} not filled — cancelled`, type: 'info' });
+          insertLog('info', `Order not filled, cancelled: ${orderId}`, { orderId }, this.state.supabaseRunId);
+          return; // Don't record as a trade
+        }
+        this.emit('log', { msg: `Order ${orderId} FILLED`, type: 'success' });
+      }
+
+      this.state.feesTotal += fee;
 
       // ── Write to Supabase trades table ───────────────────────────────────
       const supabaseTradeId = await insertTrade({
@@ -478,8 +595,7 @@ export class BotEngine {
         pricePerContract: contractPrice,
         totalCost:        actualCost,
         feeDollars:       fee,
-        signalReason:     `[${signal} conf:${indicators.confidence}%] `
-                        + (indicators.reason || indicators.mode || strategy),
+        signalReason:     `[${signal} conf:${confidence}%] ${indicators.strategyName || this.config.strategy}`,
         btcPriceAtTrade:  this.state.btcPrice,
         marketTitle:      market.ticker,
       });
@@ -497,7 +613,7 @@ export class BotEngine {
         price:      contractPrice,
         fee,
         netIfWin,
-        confidence: indicators.confidence,
+        confidence,
         orderId:    orderId || '?',
         supabaseTradeId,
         pnl:        null, // filled in after reconcile
@@ -547,44 +663,56 @@ export class BotEngine {
     this.updateCandle(price);
     this.emit('price', { price, candles: this.getAllCandles(), currentCandle: this.state.currentCandle });
 
+    // Fetch external signals (cached internally for 30s)
+    try {
+      this.state.externalSignals = await getExternalSignals();
+    } catch (_) {}
+
+    // Cooldown check
+    if (Date.now() < this.state.cooldownUntil) {
+      const remaining = Math.ceil((this.state.cooldownUntil - Date.now()) / 60000);
+      this.emit('eval', {
+        id: Date.now(), time: new Date().toLocaleTimeString('en-GB', { hour12: false }),
+        price, signal: 'NONE', confidence: 0, action: `COOLDOWN (${remaining} min remaining)`,
+      });
+      return;
+    }
+
     const indicators = this.runIndicators();
     if (!indicators) return;
 
     const { signal, confidence } = indicators;
 
     // ── Write signal evaluation to Supabase ────────────────────────────────
-    const traded = !!(signal && confidence >= this.config.minConfidence && this.config.botEnabled);
+    const traded = !!(signal && signal !== 'NONE' && confidence >= this.config.minConfidence && this.config.botEnabled);
     insertSignal({
       runId:          this.state.supabaseRunId,
-      direction:      signal ? (signal === 'YES' ? 'up' : 'down') : 'neutral',
+      direction:      signal === 'YES' ? 'up' : signal === 'NO' ? 'down' : 'neutral',
       confidence:     confidence || 0,
       btcPrice:       price,
       marketTicker:   this.state.activeMarket?.ticker ?? null,
       marketYesPrice: this.state.activeMarket?.yesBid ?? null,
-      rsi:            indicators.rsi ?? null,
-      macd:           indicators.macd ?? null,
-      macdSignal:     indicators.signal_line ?? null,
-      reasoning:      indicators.reason || indicators.mode || null,
+      rsi:            indicators.indicators?.rsi ?? null,
+      macd:           indicators.indicators?.macd?.value ?? null,
+      macdSignal:     indicators.indicators?.macd?.signal ?? null,
+      reasoning:      indicators.reasoning?.join('; ') || null,
       traded,
     });
 
-    // Log every evaluation (local + Supabase)
+    // Log every evaluation
     const evalEntry = {
       id:        Date.now(),
       time:      new Date().toLocaleTimeString('en-GB', { hour12: false }),
       price,
       signal:    signal || 'NONE',
       confidence,
-      rsi:       indicators.rsi       != null ? indicators.rsi.toFixed(1)       : '—',
-      macd:      indicators.macd      != null ? indicators.macd.toFixed(2)      : '—',
-      histogram: indicators.histogram != null ? indicators.histogram.toFixed(2) : '—',
-      bb:        indicators.bb ? `${(indicators.bbPosition * 100).toFixed(0)}%` : '—',
-      atr:       indicators.atr       != null ? indicators.atr.toFixed(2)       : '—',
+      strategy:  indicators.strategyName || this.config.strategy,
+      reasoning: indicators.reasoning,
       action:    'SKIP',
     };
 
-    if (!signal || confidence < this.config.minConfidence) {
-      evalEntry.action = signal
+    if (!signal || signal === 'NONE' || confidence < this.config.minConfidence) {
+      evalEntry.action = signal && signal !== 'NONE'
         ? `SKIP (conf ${confidence} < ${this.config.minConfidence})`
         : 'NO SIGNAL';
       this.emit('eval', evalEntry);
@@ -621,7 +749,6 @@ export class BotEngine {
     this._positionsTimer      = setInterval(() => this.fetchPositions(), 30_000);
 
     // Reconcile settled trades every 5 minutes
-    // (checks if the current market has closed and we have an open trade)
     this._reconcileTimer = setInterval(() => this._checkReconcile(), 5 * 60_000);
   }
 
@@ -638,13 +765,9 @@ export class BotEngine {
   }
 
   // ─── Reconcile check ────────────────────────────────────────────────────────
-  //
-  // Runs every 5 minutes. If we have an open supabaseTradeId and the market
-  // that trade was placed in has since closed, pull the Kalshi settled P&L.
 
   async _checkReconcile() {
     if (!this.state.supabaseTradeId) return;
-    // Find the trade in the local log to get its ticker
     const trade = this.state.tradeLog.find(t => t.supabaseTradeId === this.state.supabaseTradeId);
     if (!trade) return;
 
@@ -662,6 +785,7 @@ export class BotEngine {
       btcPrice:            this.state.btcPrice,
       candles:             this.getAllCandles(),
       indicators:          this.state.indicators,
+      lastSignal:          this.state.lastSignal,
       activeMarket:        this.state.activeMarket,
       openPositions:       this.state.openPositions,
       balance:             this.state.currentBalance,
@@ -673,6 +797,8 @@ export class BotEngine {
       botEnabled:          this.config.botEnabled,
       supabaseRunId:       this.state.supabaseRunId,
       supabaseEnabled:     isSupabaseEnabled(),
+      externalSignals:     this.state.externalSignals,
+      cooldownUntil:       this.state.cooldownUntil,
     };
   }
 }

@@ -1,17 +1,56 @@
 /**
- * Technical indicators for the Alpha Bot trading engine.
- * All functions operate on arrays of close prices (numbers).
+ * indicators.js — Four trading strategies + external signals for Alpha Bot.
+ *
+ * Strategies:
+ *   A) Swing   — EMA crossover + velocity + swing detection (ported from kalshi-trader)
+ *   B) Theta   — NO-side theta decay on KXBTCD markets (ported from kalshi-btcd-trader)
+ *   C) Scalper — Bollinger Bands + ATR volatility scalper
+ *   D) Momentum — RSI + MACD crossover with divergence detection
+ *
+ * Each analyze function returns:
+ *   { signal, confidence, reasoning[], stopLoss, targetPrice, strategyName, indicators{} }
  */
 
-/** Simple Moving Average */
-export function sma(prices, period) {
+import axios from 'axios';
+
+// ── Strategy enum ─────────────────────────────────────────────────────────────
+export const STRATEGIES = {
+  SWING:    'swing',
+  THETA:    'theta',
+  SCALPER:  'scalper',
+  MOMENTUM: 'momentum',
+};
+
+// ── Technical indicator helpers ───────────────────────────────────────────────
+
+function sma(prices, period) {
   if (prices.length < period) return null;
   const slice = prices.slice(-period);
   return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-/** Wilder's RSI(14) — standard implementation */
-export function rsi(prices, period = 14) {
+function ema(prices, period) {
+  if (prices.length < period) return null;
+  const k = 2 / (period + 1);
+  let val = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < prices.length; i++) val = prices[i] * k + val * (1 - k);
+  return val;
+}
+
+function emaArray(prices, period) {
+  if (prices.length < period) return [];
+  const k = 2 / (period + 1);
+  const result = [];
+  let val = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  result.push(val);
+  for (let i = period; i < prices.length; i++) {
+    val = prices[i] * k + val * (1 - k);
+    result.push(val);
+  }
+  return result;
+}
+
+function rsi(prices, period = 14) {
   if (prices.length < period + 1) return null;
   const deltas = [];
   for (let i = 1; i < prices.length; i++) deltas.push(prices[i] - prices[i - 1]);
@@ -32,23 +71,11 @@ export function rsi(prices, period = 14) {
   }
 
   if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+  return 100 - 100 / (1 + avgGain / avgLoss);
 }
 
-/** EMA — exponential moving average */
-export function ema(prices, period) {
-  if (prices.length < period) return null;
-  const k = 2 / (period + 1);
-  let val = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < prices.length; i++) val = prices[i] * k + val * (1 - k);
-  return val;
-}
-
-/** MACD(12,26,9) — returns { macd, signal, histogram } */
-export function macd(prices, fast = 12, slow = 26, signal = 9) {
-  if (prices.length < slow + signal) return null;
-  // Build EMA series for signal line
+function macdCalc(prices, fast = 12, slow = 26, sig = 9) {
+  if (prices.length < slow + sig) return null;
   const macdLine = [];
   for (let i = slow - 1; i < prices.length; i++) {
     const slice = prices.slice(0, i + 1);
@@ -56,30 +83,27 @@ export function macd(prices, fast = 12, slow = 26, signal = 9) {
     const e26 = ema(slice, slow);
     if (e12 != null && e26 != null) macdLine.push(e12 - e26);
   }
-  if (macdLine.length < signal) return null;
-  const signalLine = ema(macdLine, signal);
-  const macdVal = macdLine[macdLine.length - 1];
-  return { macd: macdVal, signal: signalLine, histogram: macdVal - signalLine };
+  if (macdLine.length < sig) return null;
+  const signalLine = ema(macdLine, sig);
+  const value = macdLine[macdLine.length - 1];
+  return { value, signal: signalLine, histogram: value - signalLine };
 }
 
-/** Previous MACD histogram value — for crossover detection */
-export function macdPrev(prices, fast = 12, slow = 26, signal = 9) {
-  if (prices.length < slow + signal + 1) return null;
-  return macd(prices.slice(0, -1), fast, slow, signal);
+function macdPrev(prices, fast = 12, slow = 26, sig = 9) {
+  if (prices.length < slow + sig + 1) return null;
+  return macdCalc(prices.slice(0, -1), fast, slow, sig);
 }
 
-/** Bollinger Bands(20, 2) — returns { upper, middle, lower } */
-export function bollingerBands(prices, period = 20, stdDev = 2) {
+function bollingerBands(prices, period = 20, stdDev = 2) {
   if (prices.length < period) return null;
   const slice = prices.slice(-period);
   const mean = slice.reduce((a, b) => a + b, 0) / period;
   const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
   const sd = Math.sqrt(variance);
-  return { upper: mean + stdDev * sd, middle: mean, lower: mean - stdDev * sd, bandwidth: (2 * stdDev * sd) / mean };
+  return { upper: mean + stdDev * sd, middle: mean, lower: mean - stdDev * sd };
 }
 
-/** ATR(14) — needs OHLC candles [{high, low, close}] */
-export function atr(candles, period = 14) {
+function atr(candles, period = 14) {
   if (candles.length < period + 1) return null;
   const trs = [];
   for (let i = 1; i < candles.length; i++) {
@@ -87,96 +111,648 @@ export function atr(candles, period = 14) {
     const prevClose = candles[i - 1].close;
     trs.push(Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose)));
   }
-  // Wilder's smoothing
   let atrVal = trs.slice(0, period).reduce((a, b) => a + b, 0) / period;
   for (let i = period; i < trs.length; i++) atrVal = (atrVal * (period - 1) + trs[i]) / period;
   return atrVal;
 }
 
-/**
- * Strategy A — Algo (RSI + MACD momentum or mean-reversion)
- * Returns: { signal: 'YES'|'NO'|null, confidence: 0-100, rsi, macd, histogram }
- */
-export function strategyAlgo(closes, mode = 'momentum') {
-  const rsiVal = rsi(closes);
-  const macdData = macd(closes);
-  const macdPrevData = macdPrev(closes);
-
-  if (rsiVal == null || macdData == null || macdPrevData == null) {
-    return { signal: null, confidence: 0, rsi: rsiVal, macd: macdData?.macd, histogram: macdData?.histogram, reason: 'Insufficient data' };
-  }
-
-  const { macd: macdVal, signal: signalLine, histogram } = macdData;
-  const prevHistogram = macdPrevData.histogram;
-
-  // Crossover detection
-  const bullishCross = prevHistogram <= 0 && histogram > 0;
-  const bearishCross = prevHistogram >= 0 && histogram < 0;
-
-  let signal = null;
-  let confidence = 0;
-
-  if (mode === 'momentum') {
-    // Both RSI and MACD must agree
-    if (rsiVal > 55 && (bullishCross || (histogram > 0 && macdVal > 0))) {
-      signal = 'YES';
-      const rsiStrength = Math.min((rsiVal - 55) / 30, 1); // 0-1
-      const macdStrength = Math.min(Math.abs(histogram) / 200, 1);
-      confidence = Math.round(50 + rsiStrength * 25 + macdStrength * 25);
-    } else if (rsiVal < 45 && (bearishCross || (histogram < 0 && macdVal < 0))) {
-      signal = 'NO';
-      const rsiStrength = Math.min((45 - rsiVal) / 30, 1);
-      const macdStrength = Math.min(Math.abs(histogram) / 200, 1);
-      confidence = Math.round(50 + rsiStrength * 25 + macdStrength * 25);
-    }
-  } else if (mode === 'mean_reversion') {
-    // Fade RSI extremes
-    if (rsiVal > 70 && bearishCross) {
-      signal = 'NO'; // Overbought, fade
-      confidence = Math.round(50 + Math.min((rsiVal - 70) / 20, 1) * 50);
-    } else if (rsiVal < 30 && bullishCross) {
-      signal = 'YES'; // Oversold, fade
-      confidence = Math.round(50 + Math.min((30 - rsiVal) / 20, 1) * 50);
-    }
-  }
-
-  return { signal, confidence, rsi: rsiVal, macd: macdVal, signal_line: signalLine, histogram, mode };
+function calcVelocity(prices, period = 5) {
+  if (prices.length < period * 2) return 0;
+  const recent = prices.slice(-period);
+  const prior = prices.slice(-period * 2, -period);
+  const recentMove = (recent[recent.length - 1] - recent[0]) / recent[0] * 100;
+  const priorMove = (prior[prior.length - 1] - prior[0]) / prior[0] * 100;
+  return recentMove - priorMove;
 }
 
-/**
- * Strategy B — Volatility Scalper (Bollinger Bands + ATR)
- * Returns: { signal: 'YES'|'NO'|null, confidence: 0-100, bb, atr }
- */
-export function strategyScalper(closes, candles) {
-  const bb = bollingerBands(closes);
-  const atrVal = atr(candles);
+function detectSwing(prices, lookback = 3, threshold = 0.05) {
+  if (prices.length < lookback + 1) return 0;
+  const from = prices[prices.length - 1 - lookback];
+  const to = prices[prices.length - 1];
+  const changePct = ((to - from) / from) * 100;
+  return Math.abs(changePct) >= threshold ? changePct : 0;
+}
 
-  if (!bb || atrVal == null || closes.length < 2) {
-    return { signal: null, confidence: 0, bb, atr: atrVal, reason: 'Insufficient data' };
+// ── External Signals (shared) ─────────────────────────────────────────────────
+
+let _externalCache = null;
+let _externalCacheTs = 0;
+const EXTERNAL_CACHE_TTL = 30_000; // 30 seconds
+
+export async function getExternalSignals() {
+  if (_externalCache && Date.now() - _externalCacheTs < EXTERNAL_CACHE_TTL) {
+    return _externalCache;
+  }
+
+  const result = {
+    fearGreedIndex: 50,
+    fearGreedLabel: 'Neutral',
+    fundingRate: 0,
+    orderbookPressure: 0,
+    btcPrice: 0,
+  };
+
+  // Fear & Greed
+  try {
+    const { data } = await axios.get('https://api.alternative.me/fng/?limit=1', { timeout: 5000 });
+    const fng = data?.data?.[0];
+    if (fng) {
+      result.fearGreedIndex = parseInt(fng.value, 10) || 50;
+      result.fearGreedLabel = fng.value_classification || 'Neutral';
+    }
+  } catch (_) {}
+
+  // Binance funding rate + BTC price
+  try {
+    const { data } = await axios.get('https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT', { timeout: 5000 });
+    result.fundingRate = parseFloat(data?.lastFundingRate) || 0;
+    result.btcPrice = parseFloat(data?.markPrice) || 0;
+  } catch (_) {}
+
+  // Orderbook pressure
+  try {
+    const { data } = await axios.get('https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=20', { timeout: 5000 });
+    const bids = (data?.bids || []).reduce((s, [, qty]) => s + parseFloat(qty), 0);
+    const asks = (data?.asks || []).reduce((s, [, qty]) => s + parseFloat(qty), 0);
+    const total = bids + asks;
+    result.orderbookPressure = total > 0 ? (bids - asks) / total : 0;
+  } catch (_) {}
+
+  _externalCache = result;
+  _externalCacheTs = Date.now();
+  return result;
+}
+
+// ── Strategy A: Swing ─────────────────────────────────────────────────────────
+// Ported from kalshi-trader: EMA crossover, velocity, swing detection
+
+export function analyzeSwing(candles, currentPrice, marketInfo, externalSignals) {
+  const closes = candles.map(c => c.close);
+  const reasoning = [];
+  const indicators = {};
+
+  if (closes.length < 26) {
+    return {
+      signal: 'NONE', confidence: 0, reasoning: ['Insufficient data (need 26+ candles)'],
+      stopLoss: null, targetPrice: null, strategyName: 'Swing', indicators,
+    };
+  }
+
+  // EMAs
+  const emaFast = ema(closes, 5);
+  const emaSlow = ema(closes, 20);
+  indicators.emaFast = emaFast;
+  indicators.emaSlow = emaSlow;
+
+  // RSI
+  const rsiVal = rsi(closes);
+  indicators.rsi = rsiVal;
+
+  // MACD
+  const macdData = macdCalc(closes);
+  indicators.macd = macdData;
+
+  // Velocity
+  const velocity = calcVelocity(closes, 5);
+  indicators.velocity = velocity;
+
+  // Swing detection
+  const swingPct = detectSwing(closes, 3, 0.05);
+
+  // ── Scoring ──────────────────────────────────────────────────────
+  let emaScore = 0;        // 0-20
+  let velocityScore = 0;   // 0-20
+  let swingScore = 0;      // 0-20
+  let externalScore = 0;   // 0-20
+  let contextScore = 0;    // 0-20
+
+  // EMA alignment (20pts)
+  if (emaFast != null && emaSlow != null) {
+    const emaAligned = emaFast > emaSlow;
+    if (emaAligned) {
+      emaScore = 20;
+      reasoning.push('✓ EMA 5 > EMA 20 (bullish)');
+    } else {
+      emaScore = 0;
+      reasoning.push('✗ EMA 5 < EMA 20 (bearish)');
+    }
+  }
+
+  // Velocity (20pts)
+  const absVelocity = Math.abs(velocity);
+  velocityScore = Math.min(20, Math.round(absVelocity / 0.1 * 20));
+  if (velocity > 0.02) {
+    reasoning.push(`✓ Velocity: +${velocity.toFixed(3)}% (accelerating up)`);
+  } else if (velocity < -0.02) {
+    reasoning.push(`✓ Velocity: ${velocity.toFixed(3)}% (accelerating down)`);
+  } else {
+    reasoning.push(`→ Velocity: ${velocity.toFixed(3)}% (flat)`);
+  }
+
+  // Swing position (20pts)
+  if (swingPct !== 0) {
+    swingScore = Math.min(20, Math.round(Math.abs(swingPct) / 0.05 * 5));
+    reasoning.push(`✓ Swing detected: ${swingPct > 0 ? '+' : ''}${swingPct.toFixed(2)}%`);
+  } else {
+    reasoning.push('→ No swing detected');
+  }
+
+  // External signals (20pts)
+  if (externalSignals) {
+    indicators.fearGreedIndex = externalSignals.fearGreedIndex;
+    indicators.fundingRate = externalSignals.fundingRate;
+    indicators.orderbookPressure = externalSignals.orderbookPressure;
+
+    // Fear & Greed normalization: (value/100 - 0.5) * 2 → -1 to +1
+    const fgNorm = (externalSignals.fearGreedIndex / 100 - 0.5) * 2;
+    // Funding rate: positive = bullish
+    const frNorm = externalSignals.fundingRate > 0.0003 ? 0.5 : externalSignals.fundingRate < -0.0001 ? -0.5 : 0;
+    // Orderbook pressure: direct
+    const obNorm = Math.max(-1, Math.min(1, externalSignals.orderbookPressure * 2));
+
+    // Compute composite score BEFORE using it (fix compositeScore bug)
+    const subScores = { fg: fgNorm * 0.25, fr: frNorm * 0.25, ob: obNorm * 0.35, momentum: 0.15 * (velocity > 0 ? 1 : velocity < 0 ? -1 : 0) };
+    const compositeScore = Object.values(subScores).reduce((a, b) => a + b, 0);
+
+    externalScore = Math.round(Math.abs(compositeScore) * 20);
+    reasoning.push(`→ F&G: ${externalSignals.fearGreedIndex} ${externalSignals.fearGreedLabel}`);
+    reasoning.push(`→ Funding: ${(externalSignals.fundingRate * 100).toFixed(4)}%`);
+    reasoning.push(`→ OB pressure: ${externalSignals.orderbookPressure > 0 ? '+' : ''}${externalSignals.orderbookPressure.toFixed(3)}`);
+  }
+
+  // Market context (20pts)
+  if (rsiVal != null) {
+    if (rsiVal > 55 && rsiVal < 75) contextScore += 10;
+    else if (rsiVal < 45 && rsiVal > 25) contextScore += 10;
+    if (macdData && macdData.histogram > 0) contextScore += 10;
+    else if (macdData && macdData.histogram < 0) contextScore += 5;
+    reasoning.push(`→ RSI: ${rsiVal.toFixed(1)}`);
+  }
+
+  // ── Determine signal direction ──────────────────────────────────
+  const maxScore = 100;
+  const compositeScore = emaScore + velocityScore + swingScore + externalScore + contextScore;
+  const confidence = Math.min(100, Math.round(compositeScore / maxScore * 100));
+
+  let signal = 'NONE';
+  let stopLoss = null;
+  let targetPrice = null;
+
+  // Bullish conditions
+  const bullish = (emaFast > emaSlow) && (velocity > 0 || swingPct > 0);
+  // Bearish conditions
+  const bearish = (emaFast < emaSlow) && (velocity < 0 || swingPct < 0);
+
+  // RSI sanity: overbought fade risk
+  let rsiPenalty = 0;
+  if (rsiVal != null && rsiVal > 72 && bullish) rsiPenalty = 15;
+  if (rsiVal != null && rsiVal < 28 && bearish) rsiPenalty = 15;
+
+  const adjustedConf = Math.max(0, confidence - rsiPenalty);
+
+  if (bullish && adjustedConf >= 55) {
+    signal = 'YES';
+    if (currentPrice) {
+      stopLoss = Math.round(currentPrice * 0.985);
+      targetPrice = Math.round(currentPrice * 1.02);
+    }
+  } else if (bearish && adjustedConf >= 55) {
+    signal = 'NO';
+    if (currentPrice) {
+      stopLoss = Math.round(currentPrice * 1.015);
+      targetPrice = Math.round(currentPrice * 0.98);
+    }
+  }
+
+  if (rsiPenalty > 0) {
+    reasoning.push(`✗ RSI ${rsiVal > 72 ? 'overbought' : 'oversold'} penalty: -${rsiPenalty}%`);
+  }
+
+  return {
+    signal,
+    confidence: adjustedConf,
+    reasoning,
+    stopLoss,
+    targetPrice,
+    strategyName: 'Swing',
+    indicators,
+  };
+}
+
+// ── Strategy B: Theta Decay ───────────────────────────────────────────────────
+// Ported from kalshi-btcd-trader: NO-side decay on KXBTCD markets
+
+export function analyzeThetaDecay(candles, currentPrice, marketInfo, externalSignals) {
+  const reasoning = [];
+  const indicators = {};
+
+  if (!marketInfo || !marketInfo.ticker) {
+    return {
+      signal: 'NONE', confidence: 0, reasoning: ['No KXBTCD market data available'],
+      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
+    };
+  }
+
+  const { ticker, closeTime, noAsk, noBid, yesAsk, yesBid, floorStrike, capStrike } = marketInfo;
+
+  // Parse strike from ticker (e.g., KXBTCD-26MAR1417-T71000)
+  let strikePrice = null;
+  const tickerMatch = ticker?.match(/-(T|B)([\d.]+)$/);
+  if (tickerMatch) strikePrice = parseFloat(tickerMatch[2]);
+  if (!strikePrice && capStrike) strikePrice = capStrike;
+
+  indicators.strikePrice = strikePrice;
+
+  if (!strikePrice || !currentPrice) {
+    return {
+      signal: 'NONE', confidence: 0, reasoning: ['Cannot determine strike price'],
+      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
+    };
+  }
+
+  // Distance from strike
+  const distancePct = ((strikePrice - currentPrice) / currentPrice) * 100;
+  indicators.distancePct = distancePct;
+  reasoning.push(`→ Strike: $${strikePrice.toLocaleString()} (${distancePct > 0 ? '+' : ''}${distancePct.toFixed(2)}% from BTC)`);
+
+  // Must be out-of-money by >1% for NO side to make sense
+  if (distancePct < 1.0) {
+    reasoning.push('✗ Strike too close to current price (<1%) — too risky for NO');
+    return {
+      signal: 'NONE', confidence: 0, reasoning,
+      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
+    };
+  }
+
+  // Time to expiry
+  const now = Date.now();
+  const closeMs = new Date(closeTime).getTime();
+  const minutesToExpiry = (closeMs - now) / 60000;
+  indicators.minutesToExpiry = minutesToExpiry;
+  reasoning.push(`→ Time to expiry: ${minutesToExpiry.toFixed(0)} min`);
+
+  // Time filters
+  if (minutesToExpiry < 5) {
+    reasoning.push('✗ <5 min to expiry — too risky (slippage)');
+    return {
+      signal: 'NONE', confidence: 0, reasoning,
+      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
+    };
+  }
+
+  // NO ask price check (must be reasonable)
+  const noPrice = noAsk || noBid || 0;
+  indicators.noPrice = noPrice;
+  if (noPrice < 0.75) {
+    reasoning.push(`✗ NO price ${(noPrice * 100).toFixed(0)}¢ too low — insufficient edge`);
+    return {
+      signal: 'NONE', confidence: 0, reasoning,
+      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
+    };
+  }
+
+  // ── Confidence calculation ──────────────────────────────────────
+  let confidence = 50;
+
+  // Distance bonus
+  if (distancePct >= 3) { confidence += 25; reasoning.push('✓ Strike ≥3% away — strong cushion'); }
+  else if (distancePct >= 2) { confidence += 20; reasoning.push('✓ Strike ≥2% away — good cushion'); }
+  else if (distancePct >= 1.5) { confidence += 15; reasoning.push('✓ Strike ≥1.5% away'); }
+  else { confidence += 8; reasoning.push('→ Strike 1-1.5% away — marginal'); }
+
+  // NO price bonus (higher NO price = more edge)
+  if (noPrice >= 0.90) { confidence += 15; reasoning.push('✓ NO price ≥90¢ — excellent theta'); }
+  else if (noPrice >= 0.85) { confidence += 10; reasoning.push('✓ NO price ≥85¢ — good theta'); }
+  else { confidence += 5; reasoning.push('→ NO price 75-85¢ — moderate theta'); }
+
+  // Time bonus
+  if (minutesToExpiry >= 30) { confidence += 5; reasoning.push('→ >30 min — early entry'); }
+  else if (minutesToExpiry >= 15) { confidence += 10; reasoning.push('✓ 15-30 min — ideal decay window'); }
+  else if (minutesToExpiry >= 5) { confidence += 8; reasoning.push('✓ 5-15 min — fast theta burn'); }
+
+  // Momentum check: if BTC trending toward strike, penalize
+  if (candles.length >= 12) {
+    const closes = candles.slice(-12).map(c => c.close);
+    const momentumPct = ((closes[closes.length - 1] - closes[0]) / closes[0]) * 100;
+    indicators.momentum = momentumPct;
+    if (momentumPct > 0.05 && distancePct < 1.5) {
+      confidence -= 15;
+      reasoning.push(`✗ BTC trending toward strike (+${momentumPct.toFixed(3)}%) — penalty`);
+    } else if (momentumPct < -0.05) {
+      confidence += 5;
+      reasoning.push(`✓ BTC trending away from strike (${momentumPct.toFixed(3)}%) — bonus`);
+    }
+  }
+
+  // External: extreme fear + BTC falling = bonus for NO on upside strikes
+  if (externalSignals) {
+    indicators.fearGreedIndex = externalSignals.fearGreedIndex;
+    if (externalSignals.fearGreedIndex < 30 && distancePct > 2) {
+      confidence += 5;
+      reasoning.push('✓ Extreme fear + far strike — extra NO confidence');
+    }
+  }
+
+  confidence = Math.min(95, Math.max(0, confidence));
+
+  // Time priority filter: >90 min AND confidence < 75 → skip
+  if (minutesToExpiry > 90 && confidence < 75) {
+    reasoning.push('✗ >90 min to expiry and confidence <75 — skipping');
+    return {
+      signal: 'NONE', confidence, reasoning,
+      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
+    };
+  }
+
+  // Only NO side
+  const signal = confidence >= 55 ? 'NO' : 'NONE';
+  const stopLoss = noPrice > 0 ? Math.round(noPrice * 0.80 * 100) / 100 : null;
+  const targetPrice = 0.97; // Let it expire near $1.00
+
+  return {
+    signal,
+    confidence,
+    reasoning,
+    stopLoss,
+    targetPrice,
+    strategyName: 'Theta Decay',
+    indicators,
+  };
+}
+
+// ── Strategy C: Scalper (Bollinger + ATR) ─────────────────────────────────────
+
+export function analyzeScalper(candles, currentPrice, marketInfo, externalSignals) {
+  const closes = candles.map(c => c.close);
+  const reasoning = [];
+  const indicators = {};
+
+  if (closes.length < 20 || candles.length < 15) {
+    return {
+      signal: 'NONE', confidence: 0, reasoning: ['Insufficient data (need 20+ candles)'],
+      stopLoss: null, targetPrice: null, strategyName: 'Scalper', indicators,
+    };
+  }
+
+  // Bollinger Bands
+  const bb = bollingerBands(closes, 20, 2);
+  indicators.bollingerBands = bb;
+
+  // ATR
+  const atrVal = atr(candles, 14);
+  indicators.atr = atrVal;
+
+  // ATR vs 15-period average
+  let atrAvg = null;
+  if (candles.length >= 16) {
+    const atrValues = [];
+    for (let i = 15; i <= candles.length; i++) {
+      const v = atr(candles.slice(0, i), 14);
+      if (v != null) atrValues.push(v);
+    }
+    if (atrValues.length > 0) atrAvg = atrValues.reduce((a, b) => a + b, 0) / atrValues.length;
+  }
+
+  if (!bb || atrVal == null) {
+    return {
+      signal: 'NONE', confidence: 0, reasoning: ['Indicator calculation failed'],
+      stopLoss: null, targetPrice: null, strategyName: 'Scalper', indicators,
+    };
   }
 
   const price = closes[closes.length - 1];
-  const prevAtr = atr(candles.slice(0, -1));
-  const atrExpanding = prevAtr != null && atrVal > prevAtr;
-
-  // Position within bands (0=lower, 0.5=middle, 1=upper)
   const bbRange = bb.upper - bb.lower || 1;
-  const bbPosition = (price - bb.lower) / bbRange;
+  const bbPosition = (price - bb.lower) / bbRange; // 0=lower, 1=upper
+  indicators.bbPosition = bbPosition;
 
-  let signal = null;
-  let confidence = 0;
+  // ATR filter: only trade if ATR above average (market is moving)
+  const atrAboveAvg = atrAvg != null && atrVal > atrAvg;
 
-  if (atrExpanding) {
-    if (bbPosition < 0.15) {
-      // Price near lower band with expanding volatility → mean revert up → YES
-      signal = 'YES';
-      confidence = Math.round(65 + (0.15 - bbPosition) / 0.15 * 35);
-    } else if (bbPosition > 0.85) {
-      // Price near upper band → mean revert down → NO
-      signal = 'NO';
-      confidence = Math.round(65 + (bbPosition - 0.85) / 0.15 * 35);
-    }
+  // ── Confidence sub-scores ──────────────────────────────────────
+  let bbScore = 0;       // 0-40
+  let atrScore = 0;      // 0-30
+  let volumeScore = 15;  // 0-30 (default 15 without volume data)
+
+  let signal = 'NONE';
+  let stopLoss = null;
+  let targetPrice = null;
+
+  // BB position scoring
+  if (bbPosition <= 0.10) {
+    bbScore = 40;
+    signal = 'YES';
+    reasoning.push(`✓ Price at lower BB (${(bbPosition * 100).toFixed(0)}%) — mean revert UP`);
+    stopLoss = currentPrice ? Math.round(currentPrice - 1.5 * atrVal) : null;
+    targetPrice = currentPrice ? Math.round(bb.middle) : null;
+  } else if (bbPosition <= 0.20) {
+    bbScore = 30;
+    signal = 'YES';
+    reasoning.push(`✓ Price near lower BB (${(bbPosition * 100).toFixed(0)}%) — YES signal`);
+    stopLoss = currentPrice ? Math.round(currentPrice - 1.5 * atrVal) : null;
+    targetPrice = currentPrice ? Math.round(bb.middle) : null;
+  } else if (bbPosition >= 0.90) {
+    bbScore = 40;
+    signal = 'NO';
+    reasoning.push(`✓ Price at upper BB (${(bbPosition * 100).toFixed(0)}%) — mean revert DOWN`);
+    stopLoss = currentPrice ? Math.round(currentPrice + 1.5 * atrVal) : null;
+    targetPrice = currentPrice ? Math.round(bb.middle) : null;
+  } else if (bbPosition >= 0.80) {
+    bbScore = 30;
+    signal = 'NO';
+    reasoning.push(`✓ Price near upper BB (${(bbPosition * 100).toFixed(0)}%) — NO signal`);
+    stopLoss = currentPrice ? Math.round(currentPrice + 1.5 * atrVal) : null;
+    targetPrice = currentPrice ? Math.round(bb.middle) : null;
+  } else {
+    reasoning.push(`→ Price in middle of BB (${(bbPosition * 100).toFixed(0)}%) — no edge`);
   }
 
-  return { signal, confidence, bb, atr: atrVal, atrExpanding, bbPosition, price };
+  // ATR scoring
+  if (atrAboveAvg) {
+    atrScore = 30;
+    reasoning.push(`✓ ATR ${atrVal.toFixed(2)} > avg ${atrAvg?.toFixed(2)} — volatility OK`);
+  } else if (atrAvg != null) {
+    atrScore = 10;
+    reasoning.push(`✗ ATR ${atrVal.toFixed(2)} < avg ${atrAvg?.toFixed(2)} — low volatility`);
+  } else {
+    atrScore = 15;
+    reasoning.push(`→ ATR: ${atrVal.toFixed(2)}`);
+  }
+
+  // External signals context
+  if (externalSignals) {
+    indicators.fearGreedIndex = externalSignals.fearGreedIndex;
+    indicators.orderbookPressure = externalSignals.orderbookPressure;
+    reasoning.push(`→ F&G: ${externalSignals.fearGreedIndex} ${externalSignals.fearGreedLabel}`);
+  }
+
+  const confidence = Math.min(100, bbScore + atrScore + volumeScore);
+
+  // Reset signal if no edge found
+  if (signal === 'NONE' || confidence < 60) {
+    signal = 'NONE';
+  }
+
+  return {
+    signal,
+    confidence,
+    reasoning,
+    stopLoss,
+    targetPrice,
+    strategyName: 'Scalper',
+    indicators,
+  };
+}
+
+// ── Strategy D: Momentum (RSI + MACD) ─────────────────────────────────────────
+
+export function analyzeMomentum(candles, currentPrice, marketInfo, externalSignals) {
+  const closes = candles.map(c => c.close);
+  const reasoning = [];
+  const indicators = {};
+
+  if (closes.length < 35) {
+    return {
+      signal: 'NONE', confidence: 0, reasoning: ['Insufficient data (need 35+ candles for MACD)'],
+      stopLoss: null, targetPrice: null, strategyName: 'Momentum', indicators,
+    };
+  }
+
+  // RSI
+  const rsiVal = rsi(closes);
+  const rsiPrev = rsi(closes.slice(0, -1));
+  indicators.rsi = rsiVal;
+
+  // MACD
+  const macdData = macdCalc(closes);
+  const macdPrevData = macdPrev(closes);
+  indicators.macd = macdData;
+
+  if (rsiVal == null || macdData == null || macdPrevData == null) {
+    return {
+      signal: 'NONE', confidence: 0, reasoning: ['Insufficient data for indicators'],
+      stopLoss: null, targetPrice: null, strategyName: 'Momentum', indicators,
+    };
+  }
+
+  const { histogram } = macdData;
+  const prevHistogram = macdPrevData.histogram;
+
+  // Crossover detection using previous bar comparison
+  const bullishCross = prevHistogram <= 0 && histogram > 0;
+  const bearishCross = prevHistogram >= 0 && histogram < 0;
+
+  // RSI direction
+  const rsiRising = rsiPrev != null && rsiVal > rsiPrev;
+  const rsiFalling = rsiPrev != null && rsiVal < rsiPrev;
+
+  // Divergence detection
+  let bullishDivergence = false;
+  let bearishDivergence = false;
+  if (closes.length >= 10) {
+    const recent5 = closes.slice(-5);
+    const prior5 = closes.slice(-10, -5);
+    const priceLow = Math.min(...recent5) < Math.min(...prior5);
+    const priceHigh = Math.max(...recent5) > Math.max(...prior5);
+
+    // Price makes new low but RSI doesn't = bullish divergence
+    if (priceLow && rsiPrev != null && rsiVal > rsiPrev) bullishDivergence = true;
+    // Price makes new high but RSI doesn't = bearish divergence
+    if (priceHigh && rsiPrev != null && rsiVal < rsiPrev) bearishDivergence = true;
+  }
+
+  // ── Confidence sub-scores ──────────────────────────────────────
+  let rsiScore = 0;         // 0-25
+  let crossoverScore = 0;   // 0-25
+  let histogramScore = 0;   // 0-25
+  let divergenceScore = 0;  // 0-25
+
+  let signal = 'NONE';
+  let stopLoss = null;
+  let targetPrice = null;
+
+  // ── YES conditions ──────────────────────────────────────────────
+  const yesRsi = rsiVal < 35 && rsiRising;
+  const yesMacd = bullishCross || (histogram > 0 && macdData.value > macdData.signal);
+  const yesHistogram = histogram > 0 && histogram > prevHistogram;
+
+  // ── NO conditions ───────────────────────────────────────────────
+  const noRsi = rsiVal > 65 && rsiFalling;
+  const noMacd = bearishCross || (histogram < 0 && macdData.value < macdData.signal);
+  const noHistogram = histogram < 0 && histogram < prevHistogram;
+
+  if (yesRsi || bullishDivergence) {
+    // RSI zone
+    if (rsiVal < 30) { rsiScore = 25; reasoning.push(`✓ RSI ${rsiVal.toFixed(1)} oversold + rising`); }
+    else if (rsiVal < 35) { rsiScore = 18; reasoning.push(`✓ RSI ${rsiVal.toFixed(1)} near oversold + rising`); }
+    else if (bullishDivergence) { rsiScore = 15; reasoning.push('✓ Bullish RSI divergence detected'); }
+
+    // MACD crossover
+    if (bullishCross) { crossoverScore = 25; reasoning.push('✓ MACD bullish crossover'); }
+    else if (yesMacd) { crossoverScore = 15; reasoning.push('✓ MACD positive'); }
+    else { reasoning.push('→ MACD not confirming'); }
+
+    // Histogram momentum
+    if (yesHistogram) { histogramScore = 25; reasoning.push('✓ MACD histogram expanding (bullish)'); }
+    else if (histogram > 0) { histogramScore = 12; reasoning.push('→ MACD histogram positive'); }
+    else { reasoning.push('✗ MACD histogram negative'); }
+
+    // Divergence
+    if (bullishDivergence) { divergenceScore = 25; reasoning.push('✓ Bullish divergence: price low / RSI higher'); }
+
+    signal = 'YES';
+    if (currentPrice) {
+      stopLoss = Math.round(currentPrice * 0.985);
+      targetPrice = Math.round(currentPrice * 1.025);
+    }
+  } else if (noRsi || bearishDivergence) {
+    // RSI zone
+    if (rsiVal > 70) { rsiScore = 25; reasoning.push(`✓ RSI ${rsiVal.toFixed(1)} overbought + falling`); }
+    else if (rsiVal > 65) { rsiScore = 18; reasoning.push(`✓ RSI ${rsiVal.toFixed(1)} near overbought + falling`); }
+    else if (bearishDivergence) { rsiScore = 15; reasoning.push('✓ Bearish RSI divergence detected'); }
+
+    // MACD crossover
+    if (bearishCross) { crossoverScore = 25; reasoning.push('✓ MACD bearish crossover'); }
+    else if (noMacd) { crossoverScore = 15; reasoning.push('✓ MACD negative'); }
+    else { reasoning.push('→ MACD not confirming'); }
+
+    // Histogram momentum
+    if (noHistogram) { histogramScore = 25; reasoning.push('✓ MACD histogram expanding (bearish)'); }
+    else if (histogram < 0) { histogramScore = 12; reasoning.push('→ MACD histogram negative'); }
+    else { reasoning.push('✗ MACD histogram positive'); }
+
+    // Divergence
+    if (bearishDivergence) { divergenceScore = 25; reasoning.push('✓ Bearish divergence: price high / RSI lower'); }
+
+    signal = 'NO';
+    if (currentPrice) {
+      stopLoss = Math.round(currentPrice * 1.015);
+      targetPrice = Math.round(currentPrice * 0.975);
+    }
+  } else {
+    reasoning.push(`→ RSI: ${rsiVal.toFixed(1)} (neutral zone)`);
+    reasoning.push(`→ MACD histogram: ${histogram.toFixed(2)}`);
+    reasoning.push('→ No momentum signal');
+  }
+
+  // External context
+  if (externalSignals) {
+    indicators.fearGreedIndex = externalSignals.fearGreedIndex;
+    indicators.fundingRate = externalSignals.fundingRate;
+    indicators.orderbookPressure = externalSignals.orderbookPressure;
+    reasoning.push(`→ F&G: ${externalSignals.fearGreedIndex} ${externalSignals.fearGreedLabel}`);
+  }
+
+  const confidence = Math.min(100, rsiScore + crossoverScore + histogramScore + divergenceScore);
+
+  if (confidence < 58) signal = 'NONE';
+
+  return {
+    signal,
+    confidence,
+    reasoning,
+    stopLoss,
+    targetPrice,
+    strategyName: 'Momentum',
+    indicators,
+  };
 }

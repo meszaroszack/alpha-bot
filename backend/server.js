@@ -23,7 +23,8 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const publicDir = path.join(__dirname, 'public');
 
-app.use(cors());
+// CORS — allow React frontend on port 3000
+app.use(cors({ origin: ['http://localhost:3000', 'http://127.0.0.1:3000'], credentials: true }));
 app.use(express.json());
 
 // ─── SSE broadcast to all connected frontend clients ───────────────────────
@@ -57,12 +58,12 @@ app.get('/api/events', (req, res) => {
 
 // ─── POST /api/kalshi/auth ─────────────────────────────────────────────────
 app.post('/api/kalshi/auth', async (req, res) => {
-  const { apiKey, environment = 'Demo' } = req.body || {};
+  const { apiKey, privateKey, environment = 'Demo' } = req.body || {};
   const apiKeyId = apiKey || process.env.KALSHI_API_KEY;
-  const privateKeyPem = process.env.KALSHI_API_SECRET;
+  const privateKeyPem = privateKey || process.env.KALSHI_API_SECRET;
 
   if (!apiKeyId) return res.status(400).json({ error: 'API Key is required.' });
-  if (!privateKeyPem) return res.status(500).json({ error: 'KALSHI_API_SECRET not set in backend .env' });
+  if (!privateKeyPem) return res.status(500).json({ error: 'Private key not provided.' });
 
   const baseUrl = getBaseUrl(environment);
   const p = getKalshiPath('/portfolio/balance');
@@ -87,7 +88,105 @@ app.post('/api/kalshi/auth', async (req, res) => {
   }
 });
 
-// ─── GET /api/kalshi/balance ───────────────────────────────────────────────
+// ─── GET /api/config ──────────────────────────────────────────────────────
+app.get('/api/config', (_req, res) => {
+  res.json({ config: botEngine.config });
+});
+
+// ─── POST /api/config ─────────────────────────────────────────────────────
+app.post('/api/config', (req, res) => {
+  const { strategy, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize, maxContractsPerTrade, cooldownMinutes } = req.body || {};
+  const patch = {};
+  if (strategy != null) patch.strategy = strategy;
+  if (riskPct != null) patch.riskPct = Number(riskPct);
+  if (maxPositions != null) patch.maxPositions = Number(maxPositions);
+  if (minConfidence != null) patch.minConfidence = Number(minConfidence);
+  if (dailyLossLimitPct != null) patch.dailyLossLimitPct = Number(dailyLossLimitPct);
+  if (maxTradeSize != null) patch.maxTradeSize = Number(maxTradeSize);
+  if (maxContractsPerTrade != null) patch.maxContractsPerTrade = Number(maxContractsPerTrade);
+  if (cooldownMinutes != null) patch.cooldownMinutes = Number(cooldownMinutes);
+  botEngine.setConfig(patch);
+  return res.json({ config: botEngine.config });
+});
+
+// ─── POST /api/start ──────────────────────────────────────────────────────
+app.post('/api/start', (_req, res) => {
+  botEngine.setBotEnabled(true);
+  res.json({ enabled: true });
+});
+
+// ─── POST /api/stop ───────────────────────────────────────────────────────
+app.post('/api/stop', (_req, res) => {
+  botEngine.setBotEnabled(false);
+  res.json({ enabled: false });
+});
+
+// ─── GET /api/signals ─────────────────────────────────────────────────────
+app.get('/api/signals', (_req, res) => {
+  const snap = botEngine.getSnapshot();
+  res.json({
+    lastSignal: snap.lastSignal,
+    externalSignals: snap.externalSignals,
+  });
+});
+
+// ─── GET /api/trades ──────────────────────────────────────────────────────
+app.get('/api/trades', (_req, res) => {
+  const snap = botEngine.getSnapshot();
+  res.json({
+    trades: snap.tradeLog,
+    sessionPnl: snap.sessionPnl,
+    feesTotal: snap.feesTotal,
+  });
+});
+
+// ─── GET /api/market ──────────────────────────────────────────────────────
+app.get('/api/market', (_req, res) => {
+  const market = botEngine.state?.activeMarket || null;
+  if (market) return res.json(market);
+  return res.json({ error: 'Not connected' });
+});
+
+// ─── GET /api/status ──────────────────────────────────────────────────────
+app.get('/api/status', (_req, res) => {
+  res.json({
+    supabaseEnabled: isSupabaseEnabled(),
+    supabaseRunId:   botEngine.state.supabaseRunId,
+    botEnabled:      botEngine.config.botEnabled,
+    environment:     botEngine.credentials.environment,
+    uptime:          process.uptime(),
+  });
+});
+
+// ─── POST /api/bot/toggle ─────────────────────────────────────────────────
+app.post('/api/bot/toggle', (req, res) => {
+  const { enabled } = req.body || {};
+  botEngine.setBotEnabled(!!enabled);
+  return res.json({ enabled: botEngine.config.botEnabled });
+});
+
+// ─── POST /api/bot/config (legacy) ───────────────────────────────────────
+app.post('/api/bot/config', (req, res) => {
+  const { strategy, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize, maxContractsPerTrade, cooldownMinutes } = req.body || {};
+  const patch = {};
+  if (strategy != null) patch.strategy = strategy;
+  if (riskPct != null) patch.riskPct = Number(riskPct);
+  if (maxPositions != null) patch.maxPositions = Number(maxPositions);
+  if (minConfidence != null) patch.minConfidence = Number(minConfidence);
+  if (dailyLossLimitPct != null) patch.dailyLossLimitPct = Number(dailyLossLimitPct);
+  if (maxTradeSize != null) patch.maxTradeSize = Number(maxTradeSize);
+  if (maxContractsPerTrade != null) patch.maxContractsPerTrade = Number(maxContractsPerTrade);
+  if (cooldownMinutes != null) patch.cooldownMinutes = Number(cooldownMinutes);
+  botEngine.setConfig(patch);
+  return res.json({ config: botEngine.config });
+});
+
+// ─── GET /api/bot/snapshot ────────────────────────────────────────────────
+app.get('/api/bot/snapshot', (_req, res) => {
+  res.json(botEngine.getSnapshot());
+});
+
+// ─── GET /api/kalshi/balance ──────────────────────────────────────────────
 app.get('/api/kalshi/balance', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -106,15 +205,14 @@ app.get('/api/kalshi/balance', async (req, res) => {
   }
 });
 
-// ─── GET /api/kalshi/market ────────────────────────────────────────────────
+// ─── GET /api/kalshi/market ───────────────────────────────────────────────
 app.get('/api/kalshi/market', async (req, res) => {
   const market = botEngine.state?.activeMarket || null;
   if (market) return res.json(market);
-  // Try fetching if engine hasn't started
   return res.json({ error: 'Not connected' });
 });
 
-// ─── GET /api/kalshi/positions ─────────────────────────────────────────────
+// ─── GET /api/kalshi/positions ────────────────────────────────────────────
 app.get('/api/kalshi/positions', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -141,7 +239,7 @@ app.get('/api/kalshi/positions', async (req, res) => {
   }
 });
 
-// ─── POST /api/kalshi/order ────────────────────────────────────────────────
+// ─── POST /api/kalshi/order ───────────────────────────────────────────────
 app.post('/api/kalshi/order', async (req, res) => {
   const { token, action, side, ticker, count, price, environment: bodyEnv } = req.body || {};
   if (!token) return res.status(401).json({ error: 'Session token required.' });
@@ -159,15 +257,13 @@ app.post('/api/kalshi/order', async (req, res) => {
   const p = getKalshiPath('/portfolio/orders');
   const ts = String(Date.now());
 
-  // Resolve market ticker
   const marketTicker = ticker || botEngine.state?.activeMarket?.ticker;
-  if (!marketTicker) return res.status(400).json({ error: 'No active market found. Bot must be connected first.' });
+  if (!marketTicker) return res.status(400).json({ error: 'No active market found.' });
 
   const tradeSide = (side || (action === 'buy' ? 'yes' : 'no')).toLowerCase();
   const contractCount = Math.max(1, parseInt(count, 10) || 1);
-  const contractPrice = Math.round((price || 50) * 100) / 100; // dollars
+  const contractPrice = Math.round((price || 50) * 100) / 100;
   const priceInCents = Math.round(contractPrice * 100);
-
   const fee = calcFee(contractCount, contractPrice, true);
 
   const orderBody = {
@@ -190,44 +286,6 @@ app.post('/api/kalshi/order', async (req, res) => {
     const message = err.response?.data?.message || err.response?.data?.error || err.message;
     return res.status(status).json({ error: message || 'Order failed.' });
   }
-});
-
-// ─── POST /api/bot/toggle ──────────────────────────────────────────────────
-app.post('/api/bot/toggle', (req, res) => {
-  const { enabled } = req.body || {};
-  botEngine.setBotEnabled(!!enabled);
-  return res.json({ enabled: botEngine.config.botEnabled });
-});
-
-// ─── POST /api/bot/config ──────────────────────────────────────────────────
-app.post('/api/bot/config', (req, res) => {
-  const { strategy, algoMode, riskPct, maxPositions, minConfidence, dailyLossLimitPct, maxTradeSize } = req.body || {};
-  const patch = {};
-  if (strategy != null) patch.strategy = strategy;
-  if (algoMode != null) patch.algoMode = algoMode;
-  if (riskPct != null) patch.riskPct = Number(riskPct);
-  if (maxPositions != null) patch.maxPositions = Number(maxPositions);
-  if (minConfidence != null) patch.minConfidence = Number(minConfidence);
-  if (dailyLossLimitPct != null) patch.dailyLossLimitPct = Number(dailyLossLimitPct);
-  if (maxTradeSize != null) patch.maxTradeSize = Number(maxTradeSize);
-  botEngine.setConfig(patch);
-  return res.json({ config: botEngine.config });
-});
-
-// ─── GET /api/bot/snapshot ─────────────────────────────────────────────────
-app.get('/api/bot/snapshot', (_req, res) => {
-  res.json(botEngine.getSnapshot());
-});
-
-// ─── GET /api/status ────────────────────────────────────────────────────────
-app.get('/api/status', (_req, res) => {
-  res.json({
-    supabaseEnabled: isSupabaseEnabled(),
-    supabaseRunId:   botEngine.state.supabaseRunId,
-    botEnabled:      botEngine.config.botEnabled,
-    environment:     botEngine.credentials.environment,
-    uptime:          process.uptime(),
-  });
 });
 
 // ─── Serve built frontend ──────────────────────────────────────────────────
@@ -320,7 +378,7 @@ server.listen(PORT, () => {
 // ─── Graceful shutdown — close bot_run on Railway SIGTERM ────────────────────
 async function gracefulShutdown(signal) {
   console.log(`[Server] ${signal} received — closing bot run and shutting down`);
-  botEngine.stop();        // stops timers, calls _closeRun internally
+  botEngine.stop();
   process.exit(0);
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
