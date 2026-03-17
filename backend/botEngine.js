@@ -121,14 +121,20 @@ export class BotEngine {
 
   async _openRun() {
     if (!isSupabaseEnabled()) return;
-    const runId = await openBotRun({
-      strategy:      this.config.strategy,
-      riskPct:       this.config.riskPct,
-      minConfidence: this.config.minConfidence,
-      environment:   this.credentials.environment,
-    });
-    this.state.supabaseRunId = runId;
-    console.log(`[Engine] Supabase run opened: ${runId}`);
+    try {
+      const runId = await openBotRun({
+        strategy:      this.config.strategy,
+        riskPct:       this.config.riskPct,
+        minConfidence: this.config.minConfidence,
+        environment:   this.credentials.environment,
+      });
+      this.state.supabaseRunId = runId;
+      if (runId) console.log(`[Engine] Supabase run opened: ${runId}`);
+    } catch (e) {
+      // Supabase is optional — a failure here must never stop the trading engine
+      console.warn('[Engine] _openRun failed (non-fatal) — trading continues without Supabase:', e.message);
+      this.state.supabaseRunId = null;
+    }
   }
 
   async _closeRun(status = 'stopped') {
