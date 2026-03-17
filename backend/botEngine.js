@@ -251,30 +251,36 @@ export class BotEngine {
 
   async fetchActiveMarket() {
     try {
-      // Kalshi market status values: 'active' (trading now), 'initialized' (upcoming), 'finalized'
-      // Do NOT use 'open' — it returns nothing. Query without status filter and pick by time.
       const seriesTicker = this.config.strategy === 'theta' ? 'KXBTCD' : 'KXBTC15M';
-      const data = await this.kalshiGet(`/markets?series_ticker=${seriesTicker}&limit=20`);
-      const markets = data.markets || [];
-
       const now = Date.now();
 
-      // Prefer 'active' markets (currently trading). If none, use the next 'initialized' one.
-      // Filter out already-finalized markets and ones closing in <2 min (too late to trade).
-      const tradeable = markets
-        .filter(m => {
-          const closeMs = new Date(m.close_time).getTime();
-          const minToClose = (closeMs - now) / 60000;
-          return (m.status === 'active' || m.status === 'initialized') && minToClose > 2;
-        })
-        .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
+      // Step 1: Try status=open — Kalshi returns currently-active (trading) markets.
+      // This is the PREFERRED path: it finds the live market directly.
+      let market = null;
+      try {
+        const activeData = await this.kalshiGet(`/markets?series_ticker=${seriesTicker}&status=open&limit=5`);
+        const activeMarkets = (activeData.markets || [])
+          .filter(m => {
+            const minToClose = (new Date(m.close_time).getTime() - now) / 60000;
+            return minToClose > 2; // skip markets expiring in <2 min
+          })
+          .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
+        if (activeMarkets.length > 0) market = activeMarkets[0];
+      } catch (_) {}
 
-      if (tradeable.length === 0) {
+      // Step 2: If no active market (e.g. between candle windows), fall back to
+      // the soonest upcoming 'initialized' market.
+      if (!market) {
+        const upcomingData = await this.kalshiGet(`/markets?series_ticker=${seriesTicker}&status=initialized&limit=20`);
+        const upcoming = (upcomingData.markets || [])
+          .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
+        if (upcoming.length > 0) market = upcoming[0];
+      }
+
+      if (!market) {
         this.emit('log', { msg: 'No tradeable markets found for series ' + seriesTicker, type: 'warn' });
         return null;
       }
-
-      const market = tradeable[0];
 
       // The list endpoint returns null for yes_bid/yes_ask — fetch live prices from orderbook.
       let yesBid = 0, yesAsk = 0, noBid = 0, noAsk = 0;
