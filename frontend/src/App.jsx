@@ -4,7 +4,11 @@ import {
   ResponsiveContainer, Tooltip,
 } from 'recharts';
 
-const API_BASE = 'http://localhost:3001';
+// In production (Railway), the frontend is served by the same Express process,
+// so API calls are same-origin (empty string). In local dev, backend runs on :3001.
+const API_BASE = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+  ? 'http://localhost:3001'
+  : '';
 
 // ── Fee calculator (mirrors backend) ─────────────────────────────────────────
 function calcFee(contracts, priceDollars) {
@@ -122,15 +126,35 @@ export default function App() {
   const eventSourceRef = useRef(null);
   const countdownRef = useRef(null);
 
-  // Check localStorage for saved connection
+  // Check connection on load:
+  // 1. If backend already has credentials (Railway env vars) — skip modal entirely.
+  // 2. Otherwise fall back to localStorage token from a previous manual auth.
+  // 3. If neither, show the settings modal.
   useEffect(() => {
-    const token = localStorage.getItem('alpha_token');
-    if (token) {
-      setConnected(true);
-      setEnvironment(localStorage.getItem('alpha_env') || 'Demo');
-    } else {
-      setShowSettings(true);
-    }
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/status`);
+        if (res.ok) {
+          const status = await res.json();
+          if (status.hasCredentials) {
+            // Backend initialized from env vars — go straight to dashboard
+            setConnected(true);
+            setEnvironment(status.environment || 'Live');
+            return;
+          }
+        }
+      } catch (_) {
+        // Backend unreachable — fall through to localStorage check
+      }
+      // Fall back to cached token from a previous manual auth session
+      const token = localStorage.getItem('alpha_token');
+      if (token) {
+        setConnected(true);
+        setEnvironment(localStorage.getItem('alpha_env') || 'Demo');
+      } else {
+        setShowSettings(true);
+      }
+    })();
   }, []);
 
   // SSE connection
