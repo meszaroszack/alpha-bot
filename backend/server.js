@@ -23,8 +23,18 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const publicDir = path.join(__dirname, 'public');
 
-// CORS — allow React frontend on port 3000
-app.use(cors({ origin: ['http://localhost:3000', 'http://127.0.0.1:3000'], credentials: true }));
+// CORS — allow local dev (port 3000) and same-origin Railway requests
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow same-origin (Railway production) and local dev
+    if (!origin || origin.includes('localhost') || origin.includes('railway.app') || origin.includes('up.railway.app')) {
+      cb(null, true);
+    } else {
+      cb(null, true); // Allow all for now — tighten in production if needed
+    }
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 // ─── SSE broadcast to all connected frontend clients ───────────────────────
@@ -149,12 +159,17 @@ app.get('/api/market', (_req, res) => {
 
 // ─── GET /api/status ──────────────────────────────────────────────────────
 app.get('/api/status', (_req, res) => {
+  const hasCredentials = !!(botEngine.credentials.apiKeyId && botEngine.credentials.privateKeyPem);
   res.json({
-    supabaseEnabled: isSupabaseEnabled(),
-    supabaseRunId:   botEngine.state.supabaseRunId,
-    botEnabled:      botEngine.config.botEnabled,
-    environment:     botEngine.credentials.environment,
-    uptime:          process.uptime(),
+    supabaseEnabled:  isSupabaseEnabled(),
+    supabaseRunId:    botEngine.state.supabaseRunId,
+    botEnabled:       botEngine.config.botEnabled,
+    environment:      botEngine.credentials.environment,
+    hasCredentials,           // true when loaded from env vars — frontend skips auth modal
+    credentialSource: hasCredentials
+      ? (process.env.KALSHI_API_KEY ? 'env' : 'runtime')
+      : 'none',
+    uptime:           process.uptime(),
   });
 });
 
@@ -373,6 +388,20 @@ wss.on('connection', (clientWs, request) => {
 
 server.listen(PORT, () => {
   console.log(`Alpha Bot backend running at http://localhost:${PORT}`);
+
+  // ── Auto-init from Railway env vars ───────────────────────────────────────
+  // If KALSHI_API_KEY + KALSHI_API_SECRET are set (e.g. Railway env vars),
+  // initialize the bot engine immediately — no frontend auth step required.
+  const envApiKey = process.env.KALSHI_API_KEY;
+  const envPrivateKey = process.env.KALSHI_API_SECRET;
+  const envEnvironment = process.env.KALSHI_ENVIRONMENT || 'Live';
+  if (envApiKey && envPrivateKey) {
+    console.log(`[Server] Auto-initializing credentials from env (${envEnvironment})`);
+    botEngine.setCredentials(envApiKey, envPrivateKey, envEnvironment);
+    botEngine.start();
+  } else {
+    console.log('[Server] No env credentials found — waiting for frontend auth');
+  }
 });
 
 // ─── Graceful shutdown — close bot_run on Railway SIGTERM ────────────────────
