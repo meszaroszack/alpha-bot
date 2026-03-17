@@ -191,9 +191,9 @@ export function analyzeSwing(candles, currentPrice, marketInfo, externalSignals)
   const reasoning = [];
   const indicators = {};
 
-  if (closes.length < 26) {
+  if (closes.length < 20) {
     return {
-      signal: 'NONE', confidence: 0, reasoning: ['Insufficient data (need 26+ candles)'],
+      signal: 'NONE', confidence: 0, reasoning: [`Warming up (${closes.length}/20 candles)`],
       stopLoss: null, targetPrice: null, strategyName: 'Swing', indicators,
     };
   }
@@ -487,9 +487,9 @@ export function analyzeScalper(candles, currentPrice, marketInfo, externalSignal
   const reasoning = [];
   const indicators = {};
 
-  if (closes.length < 20 || candles.length < 15) {
+  if (closes.length < 20) {
     return {
-      signal: 'NONE', confidence: 0, reasoning: ['Insufficient data (need 20+ candles)'],
+      signal: 'NONE', confidence: 0, reasoning: [`Warming up (${closes.length}/20 candles)`],
       stopLoss: null, targetPrice: null, strategyName: 'Scalper', indicators,
     };
   }
@@ -610,9 +610,9 @@ export function analyzeMomentum(candles, currentPrice, marketInfo, externalSigna
   const reasoning = [];
   const indicators = {};
 
-  if (closes.length < 35) {
+  if (closes.length < 27) {
     return {
-      signal: 'NONE', confidence: 0, reasoning: ['Insufficient data (need 35+ candles for MACD)'],
+      signal: 'NONE', confidence: 0, reasoning: [`Warming up (${closes.length}/27 candles)`],
       stopLoss: null, targetPrice: null, strategyName: 'Momentum', indicators,
     };
   }

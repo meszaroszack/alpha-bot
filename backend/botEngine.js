@@ -774,6 +774,38 @@ export class BotEngine {
     await this.placeTrade(signal, indicators);
   }
 
+  // ─── Seed historical candles from Coinbase on startup ──────────────────────
+  // Fetches last 50 completed 15-min candles so strategies can trade immediately
+  // instead of waiting 6+ hours for enough live candles to accumulate.
+  async seedHistoricalCandles() {
+    try {
+      this.emit('log', { msg: 'Seeding historical candles from Coinbase...', type: 'info' });
+      const { data } = await axios.get(
+        'https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=900&limit=50',
+        { timeout: 10000 }
+      );
+      if (!Array.isArray(data) || data.length === 0) {
+        this.emit('log', { msg: 'No historical candles returned from Coinbase', type: 'warn' });
+        return;
+      }
+      // Coinbase returns [time, low, high, open, close, volume] newest-first — reverse to oldest-first
+      const sorted = [...data].reverse();
+      // Drop the last (current incomplete) candle — only use closed candles
+      const closed = sorted.slice(0, -1);
+      this.state.candles = closed.map(([time, low, high, open, close]) => ({
+        timestamp: time * 1000,
+        open:  parseFloat(open),
+        high:  parseFloat(high),
+        low:   parseFloat(low),
+        close: parseFloat(close),
+      }));
+      this.emit('log', { msg: `Seeded ${this.state.candles.length} historical candles — ready to trade`, type: 'success' });
+      this.emit('candles', { candles: this.state.candles });
+    } catch (err) {
+      this.emit('log', { msg: `Historical candle seed failed (non-fatal): ${err.message}`, type: 'warn' });
+    }
+  }
+
   start() {
     if (this._pollTimer) return;
     this.emit('log', { msg: 'Price engine started — polling Coinbase every 15s', type: 'success' });
@@ -781,8 +813,11 @@ export class BotEngine {
     // Open a Supabase bot_run immediately
     this._openRun();
 
-    // Immediate first tick
-    this.tick();
+    // Seed historical candles FIRST, then start ticking
+    // This ensures strategies can trade on the very first cycle
+    this.seedHistoricalCandles().then(() => {
+      this.tick();
+    });
     this._pollTimer = setInterval(() => this.tick(), PRICE_POLL_MS);
 
     // Refresh market & balance on a slower cadence
