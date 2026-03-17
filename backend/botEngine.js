@@ -555,6 +555,20 @@ export class BotEngine {
       return;
     }
 
+    // Fetch fresh positions before deciding — the 30s interval cache is too stale
+    await this.fetchPositions();
+
+    // Same-market deduplication: skip if we already hold a position on this ticker
+    const activeTicker = market.ticker;
+    const existingPosition = this.state.openPositions.find(p => p.ticker === activeTicker);
+    if (existingPosition) {
+      this.emit('log', {
+        msg:  `Already have position on ${activeTicker} — skipping`,
+        type: 'info',
+      });
+      return;
+    }
+
     // Max positions check
     if (this.state.openPositions.length >= this.config.maxPositions) {
       this.emit('log', {
