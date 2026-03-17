@@ -34,10 +34,23 @@ function getClient() {
     console.warn('[Supabase] SUPABASE_URL or SUPABASE_SERVICE_KEY not set — persistence disabled');
     return null;
   }
-  _supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-  });
-  console.log('[Supabase] Client initialised');
+  // Validate URL format before passing to createClient — a malformed URL throws
+  // synchronously inside the Supabase constructor and would crash the process.
+  try {
+    new URL(SUPABASE_URL); // throws if malformed
+  } catch {
+    console.warn(`[Supabase] SUPABASE_URL is malformed: "${SUPABASE_URL}" — persistence disabled. Make sure it starts with https://.`);
+    return null;
+  }
+  try {
+    _supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    console.log('[Supabase] Client initialised');
+  } catch (e) {
+    console.warn('[Supabase] createClient threw — persistence disabled:', e.message);
+    return null;
+  }
   return _supabase;
 }
 
@@ -75,21 +88,26 @@ async function safeUpdate(table, id, patch) {
  * state so subsequent inserts can reference it).
  */
 export async function openBotRun(configSnapshot = {}) {
-  if (!BOT_USER_ID) {
-    console.warn('[Supabase] BOT_USER_ID not set — bot_run not opened');
+  try {
+    if (!BOT_USER_ID) {
+      console.warn('[Supabase] BOT_USER_ID not set — bot_run not opened (trading continues without Supabase)');
+      return null;
+    }
+    const row = {
+      user_id:         BOT_USER_ID,
+      model_id:        BOT_MODEL_ID,
+      status:          'running',
+      started_at:      new Date().toISOString(),
+      config_snapshot: configSnapshot,
+      start_balance:   null,
+    };
+    const data = await safeInsert('bot_runs', row);
+    if (data?.id) console.log(`[Supabase] bot_run opened: ${data.id}`);
+    return data?.id ?? null;
+  } catch (e) {
+    console.warn('[Supabase] openBotRun threw (non-fatal) — trading continues:', e.message);
     return null;
   }
-  const row = {
-    user_id:         BOT_USER_ID,
-    model_id:        BOT_MODEL_ID,
-    status:          'running',
-    started_at:      new Date().toISOString(),
-    config_snapshot: configSnapshot,
-    start_balance:   null, // filled in by first balance fetch
-  };
-  const data = await safeInsert('bot_runs', row);
-  if (data?.id) console.log(`[Supabase] bot_run opened: ${data.id}`);
-  return data?.id ?? null;
 }
 
 /**
