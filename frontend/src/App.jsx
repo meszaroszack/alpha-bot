@@ -335,7 +335,22 @@ export default function App() {
           <div className="panel-header">
             <span className="section-label">LIVE PRICE CHART</span>
             <span className="chart-market-info">
-              {activeMarket?.ticker || 'No market'} &middot; BTC/USD
+              {activeMarket ? (
+                <>
+                  <span className="gold">{activeMarket.ticker}</span>
+                  {activeMarket.floorStrike && (
+                    <span> &middot; Strike <span className="mono">${activeMarket.floorStrike?.toLocaleString()}</span></span>
+                  )}
+                  {activeMarket.minutesToClose != null && (
+                    <span className={activeMarket.minutesToClose < 10 ? ' red' : ' '}
+                    > &middot; Closes in <span className="mono">{activeMarket.minutesToClose}m</span></span>
+                  )}
+                  <span> &middot; YES <span className="mono green">${activeMarket.yesBid?.toFixed(2)}</span></span>
+                  <span> &middot; NO <span className="mono red">${activeMarket.noBid?.toFixed(2)}</span></span>
+                </>
+              ) : (
+                <span className="muted">Fetching market...</span>
+              )}
             </span>
           </div>
           <div className="chart-container">
@@ -387,6 +402,16 @@ export default function App() {
                     stroke="#EF4444"
                     strokeDasharray="4 4"
                     label={{ value: `Stop $${stopLoss}`, position: 'right', fill: '#EF4444', fontSize: 10 }}
+                  />
+                )}
+                {/* Strike price line — the key Kalshi reference */}
+                {activeMarket?.floorStrike && (
+                  <ReferenceLine
+                    y={activeMarket.floorStrike}
+                    stroke="#C9A84C"
+                    strokeDasharray="6 3"
+                    strokeOpacity={0.6}
+                    label={{ value: `Strike $${activeMarket.floorStrike?.toLocaleString()}`, position: 'right', fill: '#C9A84C', fontSize: 10 }}
                   />
                 )}
               </LineChart>
@@ -528,7 +553,16 @@ export default function App() {
         <span className={`status-dot ${sseConnected ? 'dot-green' : 'dot-red'}`} />
         <span className="status-text">{sseConnected ? 'CONNECTED' : 'DISCONNECTED'}</span>
         <span className="status-sep">|</span>
-        <span className="status-text">Market: {activeMarket?.ticker || '—'}</span>
+        <span className="status-text">
+          Market: {activeMarket ? (
+            <span className="gold mono">{activeMarket.ticker}</span>
+          ) : '—'}
+          {activeMarket?.minutesToClose != null && (
+            <span className={activeMarket.minutesToClose < 10 ? ' red' : ''}>
+              {' '}({activeMarket.minutesToClose}m left)
+            </span>
+          )}
+        </span>
         <span className="status-sep">|</span>
         <span className="status-text mono">BTC: {fmtPrice(btcPrice)}</span>
         <span className="status-sep">|</span>
