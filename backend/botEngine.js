@@ -251,37 +251,69 @@ export class BotEngine {
 
   async fetchActiveMarket() {
     try {
-      // Use KXBTCD series for theta strategy, KXBTC for others
-      const seriesTicker = this.config.strategy === 'theta' ? 'KXBTCD' : 'KXBTC';
-      const data = await this.kalshiGet(`/markets?series_ticker=${seriesTicker}&status=open&limit=20`);
+      // Kalshi market status values: 'active' (trading now), 'initialized' (upcoming), 'finalized'
+      // Do NOT use 'open' — it returns nothing. Query without status filter and pick by time.
+      const seriesTicker = this.config.strategy === 'theta' ? 'KXBTCD' : 'KXBTC15M';
+      const data = await this.kalshiGet(`/markets?series_ticker=${seriesTicker}&limit=20`);
       const markets = data.markets || [];
 
-      let selected;
-      if (this.config.strategy === 'theta') {
-        // Find KXBTCD markets (hourly BTC above/below)
-        selected = markets
-          .filter(m => m.ticker?.includes('KXBTCD'))
-          .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
-      } else {
-        // Find nearest-expiry KXBTC15M market
-        selected = markets
-          .filter(m => m.ticker?.includes('KXBTC15M'))
-          .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
+      const now = Date.now();
+
+      // Prefer 'active' markets (currently trading). If none, use the next 'initialized' one.
+      // Filter out already-finalized markets and ones closing in <2 min (too late to trade).
+      const tradeable = markets
+        .filter(m => {
+          const closeMs = new Date(m.close_time).getTime();
+          const minToClose = (closeMs - now) / 60000;
+          return (m.status === 'active' || m.status === 'initialized') && minToClose > 2;
+        })
+        .sort((a, b) => new Date(a.close_time) - new Date(b.close_time));
+
+      if (tradeable.length === 0) {
+        this.emit('log', { msg: 'No tradeable markets found for series ' + seriesTicker, type: 'warn' });
+        return null;
       }
 
-      if (selected.length === 0) return null;
-      const market = selected[0];
+      const market = tradeable[0];
+
+      // The list endpoint returns null for yes_bid/yes_ask — fetch live prices from orderbook.
+      let yesBid = 0, yesAsk = 0, noBid = 0, noAsk = 0;
+      try {
+        const ob = await this.kalshiGet(`/markets/${market.ticker}/orderbook`);
+        const obData = ob.orderbook_fp || ob.orderbook || {};
+
+        // yes_dollars: array of [price, quantity] — best bid = highest price with liquidity
+        const yesBids = (obData.yes_dollars || []).map(([p]) => parseFloat(p)).filter(p => p > 0);
+        const noBids  = (obData.no_dollars  || []).map(([p]) => parseFloat(p)).filter(p => 0 < p);
+
+        if (yesBids.length) {
+          yesBid = Math.max(...yesBids);
+          yesAsk = parseFloat((1 - Math.min(...noBids || [1 - yesBid])).toFixed(2));
+        }
+        if (noBids.length) {
+          noBid  = Math.max(...noBids);
+          noAsk  = parseFloat((1 - Math.min(...yesBids || [1 - noBid])).toFixed(2));
+        }
+      } catch (obErr) {
+        this.emit('log', { msg: `Orderbook fetch failed for ${market.ticker}: ${obErr.message}`, type: 'warn' });
+      }
+
+      const minutesToClose = (new Date(market.close_time).getTime() - now) / 60000;
+
       this.state.activeMarket = {
-        ticker:      market.ticker,
-        closeTime:   market.close_time,
-        floorStrike: market.floor_strike,
-        capStrike:   market.cap_strike,
-        yesBid:      (market.yes_bid || 0) / 100,
-        yesAsk:      (market.yes_ask || 0) / 100,
-        noBid:       (market.no_bid  || 0) / 100,
-        noAsk:       (market.no_ask  || 0) / 100,
+        ticker:         market.ticker,
+        closeTime:      market.close_time,
+        floorStrike:    market.floor_strike,
+        capStrike:      market.cap_strike,
+        status:         market.status,
+        minutesToClose: Math.round(minutesToClose),
+        yesBid,
+        yesAsk,
+        noBid,
+        noAsk,
       };
       this.emit('market', this.state.activeMarket);
+      console.log(`[Engine] Active market: ${market.ticker} | closes in ${Math.round(minutesToClose)}min | YES bid: ${yesBid} ask: ${yesAsk}`);
       return this.state.activeMarket;
     } catch (err) {
       this.emit('log', { msg: `Market fetch failed: ${err.message}`, type: 'error' });
