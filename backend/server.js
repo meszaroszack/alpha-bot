@@ -207,13 +207,21 @@ app.get('/api/bot/snapshot', (_req, res) => {
   res.json(botEngine.getSnapshot());
 });
 
+// Resolve private key: use runtime credentials when JWT apiKey matches botEngine, else env
+function resolvePrivateKey(apiKeyId) {
+  if (botEngine.credentials.apiKeyId === apiKeyId && botEngine.credentials.privateKeyPem)
+    return botEngine.credentials.privateKeyPem;
+  return process.env.KALSHI_API_SECRET;
+}
+
 // ─── GET /api/kalshi/balance ──────────────────────────────────────────────
 app.get('/api/kalshi/balance', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const privateKeyPem = process.env.KALSHI_API_SECRET;
+    const privateKeyPem = resolvePrivateKey(payload.apiKey);
+    if (!privateKeyPem) return res.status(500).json({ error: 'Private key not available.' });
     const base = getBaseUrl(payload.environment);
     const p = getKalshiPath('/portfolio/balance');
     const ts = String(Date.now());
@@ -239,7 +247,8 @@ app.get('/api/kalshi/positions', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    const privateKeyPem = process.env.KALSHI_API_SECRET;
+    const privateKeyPem = resolvePrivateKey(payload.apiKey);
+    if (!privateKeyPem) return res.status(500).json({ error: 'Private key not available.' });
     const base = getBaseUrl(payload.environment);
     const p = getKalshiPath('/portfolio/positions?limit=20');
     const ts = String(Date.now());
@@ -271,8 +280,8 @@ app.post('/api/kalshi/order', async (req, res) => {
 
   const apiKeyId = payload.apiKey;
   const environment = bodyEnv || payload.environment || 'Demo';
-  const privateKeyPem = process.env.KALSHI_API_SECRET;
-  if (!privateKeyPem) return res.status(500).json({ error: 'KALSHI_API_SECRET not set.' });
+  const privateKeyPem = resolvePrivateKey(apiKeyId);
+  if (!privateKeyPem) return res.status(500).json({ error: 'Private key not available.' });
 
   const base = getBaseUrl(environment);
   const p = getKalshiPath('/portfolio/orders');
@@ -342,7 +351,7 @@ wss.on('connection', (clientWs, request) => {
     } catch (_) {}
   }
 
-  const privateKeyPem = process.env.KALSHI_API_SECRET;
+  const privateKeyPem = resolvePrivateKey(resolvedApiKey) || process.env.KALSHI_API_SECRET;
   let kalshiWs = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;

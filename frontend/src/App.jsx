@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Routes, Route, useNavigate, useLocation } from 'react-router-dom';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, ReferenceLine,
   ResponsiveContainer, Tooltip,
 } from 'recharts';
+import Onboarding from './pages/Onboarding.jsx';
 
 // In production (Railway), the frontend is served by the same Express process,
 // so API calls are same-origin (empty string). In local dev, backend runs on :3001.
@@ -102,6 +104,8 @@ function ChartTooltip({ active, payload, label }) {
 
 // ── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const navigate = useNavigate();
+  const location = useLocation();
   const [connected, setConnected] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
@@ -127,9 +131,9 @@ export default function App() {
   const countdownRef = useRef(null);
 
   // Check connection on load:
-  // 1. If backend already has credentials (Railway env vars) — skip modal entirely.
-  // 2. Otherwise fall back to localStorage token from a previous manual auth.
-  // 3. If neither, show the settings modal.
+  // 1. If backend already has credentials (Railway env vars) — go to dashboard.
+  // 2. Otherwise fall back to localStorage token from a previous auth.
+  // 3. If neither and we're on /, redirect to /onboarding; if on /onboarding, stay.
   useEffect(() => {
     (async () => {
       try {
@@ -137,16 +141,12 @@ export default function App() {
         if (res.ok) {
           const status = await res.json();
           if (status.hasCredentials) {
-            // Backend initialized from env vars — go straight to dashboard
             setConnected(true);
             setEnvironment(status.environment || 'Live');
             return;
           }
         }
-      } catch (_) {
-        // Backend unreachable — fall through to localStorage check
-      }
-      // Fall back to cached token from a previous manual auth session
+      } catch (_) {}
       const token = localStorage.getItem('alpha_token');
       if (token) {
         setConnected(true);
@@ -156,6 +156,13 @@ export default function App() {
       }
     })();
   }, []);
+
+  // Redirect unauthenticated users from / to /onboarding (after auth check has run)
+  useEffect(() => {
+    if (location.pathname === '/' && showSettings && !connected) {
+      navigate('/onboarding', { replace: true });
+    }
+  }, [location.pathname, showSettings, connected, navigate]);
 
   // SSE connection
   useEffect(() => {
@@ -303,9 +310,31 @@ export default function App() {
   const grossPnl = sessionPnl + feesTotal;
   const netPnl = sessionPnl;
 
-  // Show settings if not connected
+  // On /onboarding, render dedicated onboarding page
+  if (location.pathname === '/onboarding') {
+    return (
+      <Routes>
+        <Route path="/onboarding" element={<Onboarding />} />
+      </Routes>
+    );
+  }
+
+  // On /, wait for auth check before showing dashboard or redirecting
+  if (!connected && !showSettings) {
+    return (
+      <div className="app" style={{ alignItems: 'center', justifyContent: 'center' }}>
+        <span className="gold">Loading...</span>
+      </div>
+    );
+  }
+
+  // Not connected: redirect to onboarding (effect runs after this render)
   if (showSettings && !connected) {
-    return <SettingsModal onConnect={handleConnect} error={authError} />;
+    return (
+      <div className="app" style={{ alignItems: 'center', justifyContent: 'center' }}>
+        <span className="gold">Redirecting to onboarding...</span>
+      </div>
+    );
   }
 
   return (

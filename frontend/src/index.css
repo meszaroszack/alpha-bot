@@ -638,6 +638,103 @@ body {
   cursor: not-allowed;
 }
 
+/* ── Onboarding Page ──────────────────────────────────────────────────────── */
+.onboarding-page {
+  min-height: 100vh;
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.onboarding-card {
+  background: #0A0A0A;
+  border: 1px solid rgba(201, 168, 76, 0.3);
+  border-radius: 8px;
+  padding: 40px;
+  width: 100%;
+  max-width: 480px;
+}
+
+.onboarding-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #fff;
+  margin-bottom: 8px;
+  letter-spacing: 0.02em;
+}
+
+.onboarding-subtitle {
+  font-size: 12px;
+  color: #888;
+  margin-bottom: 28px;
+  line-height: 1.4;
+}
+
+.onboarding-section {
+  margin-bottom: 24px;
+}
+
+.onboarding-section.optional {
+  opacity: 0.9;
+}
+
+.onboarding-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: #C9A84C;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.optional-tag {
+  font-size: 9px;
+  color: #666;
+  font-weight: 500;
+  text-transform: uppercase;
+}
+
+.onboarding-hint {
+  font-size: 11px;
+  color: #666;
+  margin-bottom: 6px;
+}
+
+.private-key-row {
+  margin-bottom: 8px;
+}
+
+.upload-key-btn {
+  padding: 6px 12px;
+  font-size: 12px;
+  background: #1A1A1A;
+  border: 1px solid #333;
+  color: #999;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.upload-key-btn:hover {
+  border-color: rgba(201, 168, 76, 0.4);
+  color: #C9A84C;
+}
+
+.onboarding-launch-btn {
+  margin-top: 8px;
+}
+
+.onboarding-footer {
+  font-size: 10px;
+  color: #555;
+  margin-top: 20px;
+  text-align: center;
+}
+
 /* ── Responsive ────────────────────────────────────────────────────────────── */
 @media (max-width: 900px) {
   .panels {
