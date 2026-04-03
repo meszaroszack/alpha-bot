@@ -3,7 +3,7 @@
  *
  * Strategies:
  *   A) Swing   — EMA crossover + velocity + swing detection (ported from kalshi-trader)
- *   B) Theta   — NO-side theta decay on KXBTCD markets (ported from kalshi-btcd-trader)
+ *   B) Theta   — time-decay / reference-aligned bias for KXBTC15M (15m over/under)
  *   C) Scalper — Bollinger Bands + ATR volatility scalper
  *   D) Momentum — RSI + MACD crossover with divergence detection
  *
@@ -198,6 +198,12 @@ export function analyzeSwing(candles, currentPrice, marketInfo, externalSignals)
     };
   }
 
+  // KXBTC15M reference price alignment
+  // gapPct: how far current BTC is above(+) or below(-) the market's opening reference price
+  const referencePrice = marketInfo?.referencePrice ?? null;
+  const gapPct = marketInfo?.gapPct ?? null;
+  let refBonus = 0; // confidence adjustment based on gap alignment with signal
+
   // EMAs
   const emaFast = ema(closes, 5);
   const emaSlow = ema(closes, 20);
@@ -328,9 +334,32 @@ export function analyzeSwing(candles, currentPrice, marketInfo, externalSignals)
     reasoning.push(`✗ RSI ${rsiVal > 72 ? 'overbought' : 'oversold'} penalty: -${rsiPenalty}%`);
   }
 
+  // Reference price alignment: if BTC is already above ref and signal is YES → bonus
+  // If BTC is already below ref and signal is NO → bonus
+  // If signal contradicts current gap direction → penalty
+  if (gapPct !== null && signal !== 'NONE') {
+    if (signal === 'YES' && gapPct > 0.1) {
+      refBonus = 8;
+      reasoning.push(`✓ BTC already +${gapPct.toFixed(2)}% above ref — YES momentum confirmed`);
+    } else if (signal === 'YES' && gapPct < -0.3) {
+      refBonus = -10;
+      reasoning.push(`✗ BTC ${gapPct.toFixed(2)}% BELOW ref — YES signal fighting the gap`);
+    } else if (signal === 'NO' && gapPct < -0.1) {
+      refBonus = 8;
+      reasoning.push(`✓ BTC already ${gapPct.toFixed(2)}% below ref — NO momentum confirmed`);
+    } else if (signal === 'NO' && gapPct > 0.3) {
+      refBonus = -10;
+      reasoning.push(`✗ BTC +${gapPct.toFixed(2)}% ABOVE ref — NO signal fighting the gap`);
+    }
+    reasoning.push(`→ Market ref: $${referencePrice?.toLocaleString()} | gap: ${gapPct >= 0 ? '+' : ''}${gapPct.toFixed(2)}%`);
+  }
+
+  // Apply refBonus to final confidence
+  const finalConfidence = Math.min(100, Math.max(0, adjustedConf + refBonus));
+
   return {
     signal,
-    confidence: adjustedConf,
+    confidence: finalConfidence,
     reasoning,
     stopLoss,
     targetPrice,
@@ -339,143 +368,113 @@ export function analyzeSwing(candles, currentPrice, marketInfo, externalSignals)
   };
 }
 
-// ── Strategy B: Theta Decay ───────────────────────────────────────────────────
-// Ported from kalshi-btcd-trader: NO-side decay on KXBTCD markets
+// ── Strategy B: Theta (15M) ─────────────────────────────────────────────────────
+// KXBTC15M: time-decay NO bias when flat/weak; not KXBTCD strike-cushion logic
 
 export function analyzeThetaDecay(candles, currentPrice, marketInfo, externalSignals) {
+  // For KXBTC15M: theta strategy = prefer NO entries when BTC is flat or showing weakness
+  // because NO contracts near 50¢ have the most convexity — if BTC stays flat, NO wins
+  //
+  // This is NOT the old KXBTCD strike-cushion strategy.
+  // Entry conditions: time remaining 5-13 min, BTC showing flat or downward momentum, NO ask >= 0.45
+
   const reasoning = [];
   const indicators = {};
 
-  if (!marketInfo || !marketInfo.ticker) {
-    return {
-      signal: 'NONE', confidence: 0, reasoning: ['No KXBTCD market data available'],
-      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
-    };
+  if (!marketInfo?.ticker) {
+    return { signal: 'NONE', confidence: 0, reasoning: ['No market data'], stopLoss: null, targetPrice: null, strategyName: 'Theta (15M)', indicators };
   }
 
-  const { ticker, closeTime, noAsk, noBid, yesAsk, yesBid, floorStrike, capStrike } = marketInfo;
-
-  // Parse strike from ticker (e.g., KXBTCD-26MAR1417-T71000)
-  let strikePrice = null;
-  const tickerMatch = ticker?.match(/-(T|B)([\d.]+)$/);
-  if (tickerMatch) strikePrice = parseFloat(tickerMatch[2]);
-  if (!strikePrice && capStrike) strikePrice = capStrike;
-
-  indicators.strikePrice = strikePrice;
-
-  if (!strikePrice || !currentPrice) {
-    return {
-      signal: 'NONE', confidence: 0, reasoning: ['Cannot determine strike price'],
-      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
-    };
-  }
-
-  // Distance from strike
-  const distancePct = ((strikePrice - currentPrice) / currentPrice) * 100;
-  indicators.distancePct = distancePct;
-  reasoning.push(`→ Strike: $${strikePrice.toLocaleString()} (${distancePct > 0 ? '+' : ''}${distancePct.toFixed(2)}% from BTC)`);
-
-  // Must be out-of-money by >1% for NO side to make sense
-  if (distancePct < 1.0) {
-    reasoning.push('✗ Strike too close to current price (<1%) — too risky for NO');
-    return {
-      signal: 'NONE', confidence: 0, reasoning,
-      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
-    };
-  }
-
-  // Time to expiry
+  const { closeTime, referencePrice, gapPct } = marketInfo;
   const now = Date.now();
-  const closeMs = new Date(closeTime).getTime();
-  const minutesToExpiry = (closeMs - now) / 60000;
+  const minutesToExpiry = closeTime ? (new Date(closeTime).getTime() - now) / 60000 : null;
+
   indicators.minutesToExpiry = minutesToExpiry;
-  reasoning.push(`→ Time to expiry: ${minutesToExpiry.toFixed(0)} min`);
+  indicators.referencePrice  = referencePrice;
+  indicators.gapPct          = gapPct;
 
-  // Time filters
-  if (minutesToExpiry < 5) {
-    reasoning.push('✗ <5 min to expiry — too risky (slippage)');
-    return {
-      signal: 'NONE', confidence: 0, reasoning,
-      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
-    };
+  if (minutesToExpiry == null || minutesToExpiry < 2) {
+    return { signal: 'NONE', confidence: 0, reasoning: ['<2 min to expiry — skip'], stopLoss: null, targetPrice: null, strategyName: 'Theta (15M)', indicators };
   }
 
-  // NO ask price check (must be reasonable)
-  const noPrice = noAsk || noBid || 0;
-  indicators.noPrice = noPrice;
-  if (noPrice < 0.75) {
-    reasoning.push(`✗ NO price ${(noPrice * 100).toFixed(0)}¢ too low — insufficient edge`);
-    return {
-      signal: 'NONE', confidence: 0, reasoning,
-      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
-    };
+  const closes = candles.map(c => c.close);
+  if (closes.length < 5) {
+    return { signal: 'NONE', confidence: 0, reasoning: [`Warming up (${closes.length}/5 candles)`], stopLoss: null, targetPrice: null, strategyName: 'Theta (15M)', indicators };
   }
 
-  // ── Confidence calculation ──────────────────────────────────────
-  let confidence = 50;
+  const rsiVal = rsi(closes);
+  const recentMomentum = closes.length >= 6
+    ? ((closes[closes.length - 1] - closes[closes.length - 6]) / closes[closes.length - 6]) * 100
+    : 0;
 
-  // Distance bonus
-  if (distancePct >= 3) { confidence += 25; reasoning.push('✓ Strike ≥3% away — strong cushion'); }
-  else if (distancePct >= 2) { confidence += 20; reasoning.push('✓ Strike ≥2% away — good cushion'); }
-  else if (distancePct >= 1.5) { confidence += 15; reasoning.push('✓ Strike ≥1.5% away'); }
-  else { confidence += 8; reasoning.push('→ Strike 1-1.5% away — marginal'); }
+  indicators.rsi = rsiVal;
+  indicators.recentMomentum = recentMomentum;
 
-  // NO price bonus (higher NO price = more edge)
-  if (noPrice >= 0.90) { confidence += 15; reasoning.push('✓ NO price ≥90¢ — excellent theta'); }
-  else if (noPrice >= 0.85) { confidence += 10; reasoning.push('✓ NO price ≥85¢ — good theta'); }
-  else { confidence += 5; reasoning.push('→ NO price 75-85¢ — moderate theta'); }
+  let confidence = 40;
+  let signal = 'NONE';
 
-  // Time bonus
-  if (minutesToExpiry >= 30) { confidence += 5; reasoning.push('→ >30 min — early entry'); }
-  else if (minutesToExpiry >= 15) { confidence += 10; reasoning.push('✓ 15-30 min — ideal decay window'); }
-  else if (minutesToExpiry >= 5) { confidence += 8; reasoning.push('✓ 5-15 min — fast theta burn'); }
+  reasoning.push(`→ ${minutesToExpiry.toFixed(0)} min to expiry`);
+  reasoning.push(`→ Ref price: $${referencePrice?.toLocaleString() ?? 'N/A'} | gap: ${gapPct != null ? (gapPct >= 0 ? '+' : '') + gapPct.toFixed(2) + '%' : 'N/A'}`);
 
-  // Momentum check: if BTC trending toward strike, penalize
-  if (candles.length >= 12) {
-    const closes = candles.slice(-12).map(c => c.close);
-    const momentumPct = ((closes[closes.length - 1] - closes[0]) / closes[0]) * 100;
-    indicators.momentum = momentumPct;
-    if (momentumPct > 0.05 && distancePct < 1.5) {
-      confidence -= 15;
-      reasoning.push(`✗ BTC trending toward strike (+${momentumPct.toFixed(3)}%) — penalty`);
-    } else if (momentumPct < -0.05) {
-      confidence += 5;
-      reasoning.push(`✓ BTC trending away from strike (${momentumPct.toFixed(3)}%) — bonus`);
-    }
+  // Ideal theta window: 5-13 minutes left (maximum time pressure)
+  if (minutesToExpiry >= 5 && minutesToExpiry <= 13) {
+    confidence += 20;
+    reasoning.push('✓ Ideal theta window (5-13 min) — maximum time pressure');
+  } else if (minutesToExpiry > 13 && minutesToExpiry <= 30) {
+    confidence += 8;
+    reasoning.push('→ Early-mid decay window (13-30 min)');
+  } else {
+    reasoning.push(`→ ${minutesToExpiry.toFixed(0)} min remaining — too early for theta bias`);
   }
 
-  // External: extreme fear + BTC falling = bonus for NO on upside strikes
-  if (externalSignals) {
-    indicators.fearGreedIndex = externalSignals.fearGreedIndex;
-    if (externalSignals.fearGreedIndex < 30 && distancePct > 2) {
-      confidence += 5;
-      reasoning.push('✓ Extreme fear + far strike — extra NO confidence');
+  // Prefer NO when BTC is flat or slightly below reference (NO wins if BTC stays here)
+  if (gapPct !== null && gapPct <= 0.1 && gapPct >= -0.5) {
+    confidence += 15;
+    signal = 'NO';
+    reasoning.push(`✓ BTC near/below ref (${gapPct.toFixed(2)}%) — flat close likely resolves NO`);
+  } else if (gapPct !== null && gapPct > 0.1 && gapPct < 0.5) {
+    confidence += 5;
+    signal = 'YES';
+    reasoning.push(`→ BTC slightly above ref (+${gapPct.toFixed(2)}%) — gentle YES lean`);
+  } else if (gapPct !== null && gapPct >= 0.5) {
+    confidence += 15;
+    signal = 'YES';
+    reasoning.push(`✓ BTC +${gapPct.toFixed(2)}% above ref — YES likely at expiry`);
+  } else if (gapPct !== null && gapPct <= -0.5) {
+    confidence += 20;
+    signal = 'NO';
+    reasoning.push(`✓ BTC ${gapPct.toFixed(2)}% below ref — strong NO`);
+  }
+
+  // RSI filter
+  if (rsiVal !== null) {
+    indicators.rsi = rsiVal;
+    if (rsiVal < 40 && signal === 'NO') { confidence += 10; reasoning.push(`✓ RSI ${rsiVal.toFixed(1)} confirms downside`); }
+    else if (rsiVal > 60 && signal === 'YES') { confidence += 10; reasoning.push(`✓ RSI ${rsiVal.toFixed(1)} confirms upside`); }
+    else reasoning.push(`→ RSI: ${rsiVal.toFixed(1)}`);
+  }
+
+  // Momentum filter
+  if (Math.abs(recentMomentum) > 0.1) {
+    if ((recentMomentum < 0 && signal === 'NO') || (recentMomentum > 0 && signal === 'YES')) {
+      confidence += 10;
+      reasoning.push(`✓ Momentum ${recentMomentum >= 0 ? '+' : ''}${recentMomentum.toFixed(3)}% confirms signal`);
+    } else {
+      confidence -= 8;
+      reasoning.push(`✗ Momentum ${recentMomentum >= 0 ? '+' : ''}${recentMomentum.toFixed(3)}% contradicts signal`);
     }
   }
 
   confidence = Math.min(95, Math.max(0, confidence));
-
-  // Time priority filter: >90 min AND confidence < 75 → skip
-  if (minutesToExpiry > 90 && confidence < 75) {
-    reasoning.push('✗ >90 min to expiry and confidence <75 — skipping');
-    return {
-      signal: 'NONE', confidence, reasoning,
-      stopLoss: null, targetPrice: null, strategyName: 'Theta Decay', indicators,
-    };
-  }
-
-  // Only NO side
-  const signal = confidence >= 55 ? 'NO' : 'NONE';
-  const stopLoss = noPrice > 0 ? Math.round(noPrice * 0.80 * 100) / 100 : null;
-  const targetPrice = 0.97; // Let it expire near $1.00
+  if (confidence < 55) signal = 'NONE';
 
   return {
     signal,
     confidence,
     reasoning,
-    stopLoss,
-    targetPrice,
-    strategyName: 'Theta Decay',
+    stopLoss: null,
+    targetPrice: null,
+    strategyName: 'Theta (15M)',
     indicators,
   };
 }
@@ -493,6 +492,12 @@ export function analyzeScalper(candles, currentPrice, marketInfo, externalSignal
       stopLoss: null, targetPrice: null, strategyName: 'Scalper', indicators,
     };
   }
+
+  // KXBTC15M reference price alignment
+  // gapPct: how far current BTC is above(+) or below(-) the market's opening reference price
+  const referencePrice = marketInfo?.referencePrice ?? null;
+  const gapPct = marketInfo?.gapPct ?? null;
+  let refBonus = 0; // confidence adjustment based on gap alignment with signal
 
   // Bollinger Bands
   const bb = bollingerBands(closes, 20, 2);
@@ -592,9 +597,29 @@ export function analyzeScalper(candles, currentPrice, marketInfo, externalSignal
     signal = 'NONE';
   }
 
+  if (gapPct !== null && signal !== 'NONE') {
+    if (signal === 'YES' && gapPct > 0.1) {
+      refBonus = 8;
+      reasoning.push(`✓ BTC +${gapPct.toFixed(2)}% above ref — YES aligns`);
+    } else if (signal === 'YES' && gapPct < -0.3) {
+      refBonus = -10;
+      reasoning.push(`✗ BTC ${gapPct.toFixed(2)}% below ref — gap fights YES`);
+    } else if (signal === 'NO' && gapPct < -0.1) {
+      refBonus = 8;
+      reasoning.push(`✓ BTC ${gapPct.toFixed(2)}% below ref — NO aligns`);
+    } else if (signal === 'NO' && gapPct > 0.3) {
+      refBonus = -10;
+      reasoning.push(`✗ BTC +${gapPct.toFixed(2)}% above ref — gap fights NO`);
+    }
+    reasoning.push(`→ Market ref: $${referencePrice?.toLocaleString()} | gap: ${gapPct >= 0 ? '+' : ''}${gapPct.toFixed(2)}%`);
+  }
+
+  const finalConfidence = Math.min(100, Math.max(0, confidence + refBonus));
+  if (finalConfidence < 60) signal = 'NONE';
+
   return {
     signal,
-    confidence,
+    confidence: finalConfidence,
     reasoning,
     stopLoss,
     targetPrice,
@@ -616,6 +641,12 @@ export function analyzeMomentum(candles, currentPrice, marketInfo, externalSigna
       stopLoss: null, targetPrice: null, strategyName: 'Momentum', indicators,
     };
   }
+
+  // KXBTC15M reference price alignment
+  // gapPct: how far current BTC is above(+) or below(-) the market's opening reference price
+  const referencePrice = marketInfo?.referencePrice ?? null;
+  const gapPct = marketInfo?.gapPct ?? null;
+  let refBonus = 0; // confidence adjustment based on gap alignment with signal
 
   // RSI
   const rsiVal = rsi(closes);
@@ -746,9 +777,29 @@ export function analyzeMomentum(candles, currentPrice, marketInfo, externalSigna
 
   if (confidence < 58) signal = 'NONE';
 
+  if (gapPct !== null && signal !== 'NONE') {
+    if (signal === 'YES' && gapPct > 0.1) {
+      refBonus = 8;
+      reasoning.push(`✓ BTC +${gapPct.toFixed(2)}% above ref — YES momentum aligns`);
+    } else if (signal === 'YES' && gapPct < -0.3) {
+      refBonus = -10;
+      reasoning.push(`✗ BTC ${gapPct.toFixed(2)}% below ref — gap fights YES`);
+    } else if (signal === 'NO' && gapPct < -0.1) {
+      refBonus = 8;
+      reasoning.push(`✓ BTC ${gapPct.toFixed(2)}% below ref — NO momentum aligns`);
+    } else if (signal === 'NO' && gapPct > 0.3) {
+      refBonus = -10;
+      reasoning.push(`✗ BTC +${gapPct.toFixed(2)}% above ref — gap fights NO`);
+    }
+    reasoning.push(`→ Market ref: $${referencePrice?.toLocaleString()} | gap: ${gapPct >= 0 ? '+' : ''}${gapPct.toFixed(2)}%`);
+  }
+
+  const finalConfidence = Math.min(100, Math.max(0, confidence + refBonus));
+  if (finalConfidence < 58) signal = 'NONE';
+
   return {
     signal,
-    confidence,
+    confidence: finalConfidence,
     reasoning,
     stopLoss,
     targetPrice,

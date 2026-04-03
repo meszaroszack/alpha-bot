@@ -257,7 +257,7 @@ export class BotEngine {
 
   async fetchActiveMarket() {
     try {
-      const seriesTicker = this.config.strategy === 'theta' ? 'KXBTCD' : 'KXBTC15M';
+      const seriesTicker = 'KXBTC15M';
       const now = Date.now();
 
       // Step 1: Try status=open — Kalshi returns currently-active (trading) markets.
@@ -312,9 +312,17 @@ export class BotEngine {
 
       const minutesToClose = (new Date(market.close_time).getTime() - now) / 60000;
 
+      // For KXBTC15M: floor_strike = the BTC price when this market opened (the YES/NO line)
+      const referencePrice = market.floor_strike ?? market.cap_strike ?? null;
+      const gapPct = (referencePrice && this.state.btcPrice)
+        ? (((this.state.btcPrice - referencePrice) / referencePrice) * 100)
+        : null;
+
       this.state.activeMarket = {
         ticker:         market.ticker,
         closeTime:      market.close_time,
+        referencePrice,                       // the BTC price at market open (the line to beat)
+        gapPct,                               // how far current BTC is from the reference, + = above, - = below
         floorStrike:    market.floor_strike,
         capStrike:      market.cap_strike,
         status:         market.status,
@@ -325,7 +333,7 @@ export class BotEngine {
         noAsk,
       };
       this.emit('market', this.state.activeMarket);
-      console.log(`[Engine] Active market: ${market.ticker} | closes in ${Math.round(minutesToClose)}min | YES bid: ${yesBid} ask: ${yesAsk}`);
+      console.log(`[Engine] Active market: ${market.ticker} | ref: $${referencePrice?.toLocaleString()} | BTC gap: ${gapPct != null ? (gapPct >= 0 ? '+' : '') + gapPct.toFixed(2) + '%' : 'N/A'} | closes in ${Math.round(minutesToClose)}min`);
       return this.state.activeMarket;
     } catch (err) {
       this.emit('log', { msg: `Market fetch failed: ${err.message}`, type: 'error' });
@@ -383,14 +391,18 @@ export class BotEngine {
   // Polls Kalshi for the actual settled P&L and stamps it on the trade row.
   // This is the ONLY number that should be trusted for accounting.
 
-  async reconcileSettledTrade(ticker) {
-    if (!this.state.supabaseTradeId) return;
+  async reconcileSettledTrade(ticker, logSupabaseTradeId = null) {
     const { apiKeyId, privateKeyPem, environment } = this.credentials;
     if (!apiKeyId || !privateKeyPem) return;
 
-    const runId   = this.state.supabaseRunId;
-    const tradeId = this.state.supabaseTradeId;
-    this.state.supabaseTradeId = null; // clear immediately — don't reconcile twice
+    const tradeId = logSupabaseTradeId ?? this.state.supabaseTradeId;
+    if (!tradeId) return;
+
+    if (this.state.supabaseTradeId === tradeId) {
+      this.state.supabaseTradeId = null; // clear when reconciling the current open trade
+    }
+
+    const runId = this.state.supabaseRunId;
 
     console.log(`[Reconcile] Fetching settled P&L for ${ticker}...`);
     insertLog('reconcile', `Reconciling ${ticker}`, { ticker }, runId);
@@ -410,16 +422,28 @@ export class BotEngine {
       const pos       = positions.find(p => p.ticker === ticker);
 
       if (pos) {
+        console.log(`[DIAG] RECONCILE FOUND | ticker: ${ticker} | realized_pnl_dollars: ${pos.realized_pnl_dollars} | realized_pnl: ${pos.realized_pnl} | settlement_value: ${pos.settlement_value} | total_traded: ${pos.total_traded} | position: ${pos.position} | no_position: ${pos.no_position} | position_fp: ${pos.position_fp}`);
+
         if (pos.realized_pnl_dollars != null) {
           reconciledPnl = parseFloat(pos.realized_pnl_dollars);
         } else if (pos.realized_pnl != null && pos.realized_pnl !== 0) {
           reconciledPnl = pos.realized_pnl / 100;
-        } else if (pos.settlement_value != null) {
-          const contracts   = Math.abs(pos.position_fp ?? pos.position ?? 1);
-          const settledPay  = (pos.settlement_value / 100) * contracts;
-          const cost        = (pos.total_traded || 0) / 100;
+        } else {
+          // settlement_value from Kalshi is in cents per contract (100 = win, 0 = loss)
+          // total_traded is total cost paid in cents
+          const contracts   = Math.abs(pos.position_fp ?? pos.position ?? pos.no_position ?? 1);
+          const settledPay  = ((pos.settlement_value ?? 0) / 100) * contracts; // cents→dollars per contract × contracts
+          const cost        = (pos.total_traded ?? 0) / 100;                   // cents → dollars
           reconciledPnl     = settledPay - cost;
+          if (reconciledPnl === 0 && (pos.settlement_value ?? 0) >= 100 && contracts > 0) {
+            reconciledPnl = contracts * 1.0 - cost;
+          }
+          if (reconciledPnl === 0 && pos.settlement_value == null) {
+            console.warn(`[Reconcile] settlement_value missing for ${ticker} — P&L may be inaccurate`);
+          }
         }
+      } else {
+        console.log(`[DIAG] RECONCILE MISS | ticker: ${ticker} | total settled positions checked: ${positions.length} | tickers: ${positions.map(p => p.ticker).join(', ')}`);
       }
 
       if (reconciledPnl !== null) {
@@ -454,6 +478,9 @@ export class BotEngine {
         ? `SETTLED ✓ Kalshi: ${reconciledPnl >= 0 ? '+' : ''}$${reconciledPnl.toFixed(2)}`
         : 'SETTLED — P&L not available from Kalshi API',
     });
+
+    const logEntryMatch = this.state.tradeLog.find(t => t.supabaseTradeId === tradeId);
+    if (logEntryMatch) logEntryMatch.pnl = reconciledPnl;
 
     // Update session P&L with the real number
     if (reconciledPnl !== null) {
@@ -501,20 +528,6 @@ export class BotEngine {
       if (ext.fearGreedIndex > 80 && result.signal === 'NO') {
         result.confidence = Math.max(0, result.confidence - 15);
         result.reasoning.push('✗ Extreme greed (F&G >80) + NO signal — confidence reduced 15pts');
-      }
-    }
-
-    // Decay entry logic for theta strategy
-    if (this.config.strategy === STRATEGIES.THETA && marketInfo?.closeTime) {
-      const minutesToExpiry = (new Date(marketInfo.closeTime).getTime() - Date.now()) / 60000;
-      if (minutesToExpiry < 5) {
-        result.signal = 'NONE';
-        result.reasoning.push('✗ <5 min to expiry — too risky for theta');
-      } else if (minutesToExpiry <= 30) {
-        result.reasoning.push('✓ Ideal theta decay window (5-30 min)');
-      } else if (minutesToExpiry > 90 && result.confidence < 75) {
-        result.signal = 'NONE';
-        result.reasoning.push('✗ >90 min to expiry, confidence <75 — skipping');
       }
     }
 
@@ -633,6 +646,8 @@ export class BotEngine {
         : { no_price:  priceInCents }),
       client_order_id: `alpha-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     };
+
+    console.log(`[DIAG] ORDER | ${signal} ${contracts}c on ${market.ticker} @ ${priceInCents}¢ | refPrice: $${market.referencePrice} | BTC: $${this.state.btcPrice} | gap: ${market.gapPct != null ? (market.gapPct >= 0 ? '+' : '') + market.gapPct.toFixed(2) + '%' : 'N/A'}`);
 
     try {
       const result = await this.kalshiPost('/portfolio/orders', orderBody);
@@ -892,6 +907,7 @@ export class BotEngine {
     this.state.btcPrice = price;
     this.updateCandle(price);
     this.emit('price', { price, candles: this.getAllCandles(), currentCandle: this.state.currentCandle });
+    console.log(`[DIAG] tick | BTC: $${price} | activeMarket: ${this.state.activeMarket?.ticker ?? 'none'} | ref: $${this.state.activeMarket?.referencePrice ?? 'N/A'} | gap: ${this.state.activeMarket?.gapPct != null ? (this.state.activeMarket.gapPct >= 0 ? '+' : '') + this.state.activeMarket.gapPct.toFixed(2) + '%' : 'N/A'}`);
 
     // Fetch external signals (cached internally for 30s)
     try {
@@ -920,6 +936,8 @@ export class BotEngine {
 
     const indicators = this.runIndicators();
     if (!indicators) return;
+
+    console.log(`[DIAG] indicators | strategy: ${this.config.strategy} | signal: ${indicators.signal} | confidence: ${indicators.confidence} | threshold: ${this.config.minConfidence}`);
 
     const { signal, confidence } = indicators;
 
@@ -952,6 +970,9 @@ export class BotEngine {
     };
 
     if (!signal || signal === 'NONE' || confidence < this.config.minConfidence) {
+      if (signal && signal !== 'NONE' && confidence < this.config.minConfidence) {
+        console.log(`[DIAG] SKIP | signal: ${signal} confidence: ${confidence} < threshold: ${this.config.minConfidence} — no trade`);
+      }
       evalEntry.action = signal && signal !== 'NONE'
         ? `SKIP (conf ${confidence} < ${this.config.minConfidence})`
         : 'NO SIGNAL';
@@ -1042,16 +1063,22 @@ export class BotEngine {
   // ─── Reconcile check ────────────────────────────────────────────────────────
 
   async _checkReconcile() {
-    if (!this.state.supabaseTradeId) return;
-    const trade = this.state.tradeLog.find(t => t.supabaseTradeId === this.state.supabaseTradeId);
-    if (!trade) return;
+    // Reconcile any trade whose market has already expired
+    for (const trade of this.state.tradeLog) {
+      if (!trade.supabaseTradeId) continue;
+      if (trade.pnl !== null && trade.pnl !== undefined) continue; // already reconciled
 
-    const market = this.state.activeMarket;
-    if (!market) return;
+      // Check if this trade's market has expired
+      const market = this.state.activeMarket;
+      const tradeIsStale = !market || trade.market !== market.ticker;
+      const tradeIsOld = (Date.now() - trade.id) > 16 * 60 * 1000; // older than 16 min
 
-    // If the current market ticker differs from the trade's market, the candle closed
-    if (trade.market !== market.ticker) {
-      await this.reconcileSettledTrade(trade.market);
+      if (tradeIsStale || tradeIsOld) {
+        console.log(`[DIAG] _checkReconcile firing for stale trade: ${trade.market}`);
+        await this.reconcileSettledTrade(trade.market, trade.supabaseTradeId);
+        // Only reconcile one at a time per interval
+        break;
+      }
     }
   }
 
